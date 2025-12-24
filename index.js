@@ -37,11 +37,15 @@ const client = new Client({
 });
 
 /* ===============================
-   Slash Command
+   Slash Commands
 ================================ */
-const CMD = new SlashCommandBuilder()
+const CMD_LEAVE = new SlashCommandBuilder()
   .setName("setup_leave_button")
   .setDescription("在目前頻道發送「請假」按鈕");
+
+const CMD_REPORT = new SlashCommandBuilder()
+  .setName("setup_report_button")
+  .setDescription("在目前頻道發送「問題回報」按鈕");
 
 async function registerCommands() {
   const { DISCORD_TOKEN, CLIENT_ID, GUILD_ID } = process.env;
@@ -52,13 +56,14 @@ async function registerCommands() {
 
   const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
   await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
-    body: [CMD.toJSON()],
+    body: [CMD_LEAVE.toJSON(), CMD_REPORT.toJSON()],
   });
 
-  console.log("✅ Slash command registered");
+  console.log("✅ Slash commands registered");
 }
 
-client.once("clientReady", async () => {
+/* ✅ 正確事件名稱：ready */
+client.once("ready", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   try {
     await registerCommands();
@@ -80,6 +85,21 @@ function buildLeaveButtonMessage() {
 
   const embed = new EmbedBuilder()
     .setTitle("請假申請")
+    .setDescription("按下按鈕後會跳出表單，填完送出即可。");
+
+  return { embeds: [embed], components: [row] };
+}
+
+function buildReportButtonMessage() {
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("report_button")
+      .setLabel("🛠️ 問題回報")
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  const embed = new EmbedBuilder()
+    .setTitle("問題回報")
     .setDescription("按下按鈕後會跳出表單，填完送出即可。");
 
   return { embeds: [embed], components: [row] };
@@ -117,6 +137,41 @@ function buildLeaveModal() {
   return modal;
 }
 
+function buildReportModal() {
+  const modal = new ModalBuilder()
+    .setCustomId("report_modal")
+    .setTitle("問題回報表單");
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId("report_title")
+        .setLabel("標題")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(60)
+    ),
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId("report_type")
+        .setLabel("類型（問題 / 建議 / 其他）")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(30)
+    ),
+    new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId("report_desc")
+        .setLabel("詳細描述")
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true)
+        .setMaxLength(1000)
+    )
+  );
+
+  return modal;
+}
+
 function safeGet(interaction, id, fallback = "") {
   try {
     const v = interaction.fields.getTextInputValue(id);
@@ -128,8 +183,8 @@ function safeGet(interaction, id, fallback = "") {
 
 /**
  * ✅ 互動保護：
- * - 10062 Unknown interaction：通常是互動過期/冷啟動/重啟時點到 → 回也回不了，直接吞掉
- * - 40060 Already acknowledged：代表已回應過，避免再回造成連鎖錯誤
+ * - 10062 Unknown interaction：互動過期/重啟時點到
+ * - 40060 Already acknowledged：已回應過
  */
 function isIgnorableDiscordInteractionError(err) {
   return err?.code === 10062 || err?.code === 40060;
@@ -140,12 +195,11 @@ function isIgnorableDiscordInteractionError(err) {
 ================================ */
 client.on("interactionCreate", async (interaction) => {
   try {
-    // 1) /setup_leave_button：先回覆操作者（ephemeral），再在頻道送出按鈕訊息
+    // 1) /setup_leave_button
     if (
       interaction.isChatInputCommand() &&
       interaction.commandName === "setup_leave_button"
     ) {
-      // ✅ 先搶回覆，避免任何延遲導致 Unknown interaction
       await interaction.reply({
         content: "✅ 已在此頻道建立請假按鈕",
         flags: MessageFlags.Ephemeral,
@@ -155,13 +209,32 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    // 2) Button -> Modal：3 秒內一定要 showModal，這裡不要做其他 await
+    // 1-2) /setup_report_button
+    if (
+      interaction.isChatInputCommand() &&
+      interaction.commandName === "setup_report_button"
+    ) {
+      await interaction.reply({
+        content: "✅ 已在此頻道建立問題回報按鈕",
+        flags: MessageFlags.Ephemeral,
+      });
+
+      await interaction.channel.send(buildReportButtonMessage());
+      return;
+    }
+
+    // 2) Button -> Modal（不要做多餘 await）
     if (interaction.isButton() && interaction.customId === "leave_button") {
       await interaction.showModal(buildLeaveModal());
       return;
     }
 
-    // 3) Modal Submit：先 deferReply（搶 3 秒），再做送頻道/回覆
+    if (interaction.isButton() && interaction.customId === "report_button") {
+      await interaction.showModal(buildReportModal());
+      return;
+    }
+
+    // 3) Leave Modal Submit
     if (interaction.isModalSubmit() && interaction.customId === "leave_modal") {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
@@ -189,7 +262,9 @@ client.on("interactionCreate", async (interaction) => {
       const channel = await client.channels.fetch(leaveChannelId).catch(() => null);
 
       if (!channel || !channel.isTextBased()) {
-        await interaction.editReply("❌ 請假頻道不存在/不是文字頻道（LEAVE_CHANNEL_ID 可能錯）");
+        await interaction.editReply(
+          "❌ 請假頻道不存在/不是文字頻道（LEAVE_CHANNEL_ID 可能錯）"
+        );
         return;
       }
 
@@ -197,8 +272,45 @@ client.on("interactionCreate", async (interaction) => {
       await interaction.editReply("✅ 已送出請假申請");
       return;
     }
+
+    // 4) Report Modal Submit
+    if (interaction.isModalSubmit() && interaction.customId === "report_modal") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+      const title = safeGet(interaction, "report_title");
+      const type = safeGet(interaction, "report_type");
+      const desc = safeGet(interaction, "report_desc");
+
+      const embed = new EmbedBuilder()
+        .setTitle("🛠️ 新的問題回報")
+        .addFields(
+          { name: "回報者", value: `${interaction.user}`, inline: true },
+          { name: "類型", value: type || "（未填）", inline: true },
+          { name: "標題", value: title || "（未填）" },
+          { name: "詳細描述", value: desc || "（未填）" }
+        )
+        .setTimestamp();
+
+      const reportChannelId = process.env.REPORT_CHANNEL_ID;
+      if (!reportChannelId) {
+        await interaction.editReply("❌ 未設定 REPORT_CHANNEL_ID（Render 環境變數）");
+        return;
+      }
+
+      const channel = await client.channels.fetch(reportChannelId).catch(() => null);
+
+      if (!channel || !channel.isTextBased()) {
+        await interaction.editReply(
+          "❌ 問題回報頻道不存在/不是文字頻道（REPORT_CHANNEL_ID 可能錯）"
+        );
+        return;
+      }
+
+      await channel.send({ embeds: [embed] });
+      await interaction.editReply("✅ 已送出問題回報，感謝！");
+      return;
+    }
   } catch (err) {
-    // ✅ 關鍵保護：互動過期/已回應過 → 直接忽略，不要狂噴錯誤、也不要再回
     if (isIgnorableDiscordInteractionError(err)) {
       console.warn(`⚠️ Ignored interaction error: code=${err.code}`);
       return;
@@ -206,7 +318,6 @@ client.on("interactionCreate", async (interaction) => {
 
     console.error("❌ interaction error:", err);
 
-    // ✅ 保底回覆：只在「還沒回」時才回
     if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
       await interaction
         .reply({
@@ -215,7 +326,6 @@ client.on("interactionCreate", async (interaction) => {
         })
         .catch(() => {});
     } else if (interaction.isRepliable() && interaction.deferred) {
-      // defer 了但後面炸了，盡量 editReply（避免使用者卡住）
       await interaction.editReply("❌ 發生錯誤，請稍後再試").catch(() => {});
     }
   }
