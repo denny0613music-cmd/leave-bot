@@ -68,7 +68,7 @@ client.once("clientReady", async () => {
 });
 
 /* ===============================
-   Builder helpers
+   Helpers
 ================================ */
 function buildLeaveButtonMessage() {
   const row = new ActionRowBuilder().addComponents(
@@ -126,16 +126,26 @@ function safeGet(interaction, id, fallback = "") {
   }
 }
 
+/**
+ * ✅ 互動保護：
+ * - 10062 Unknown interaction：通常是互動過期/冷啟動/重啟時點到 → 回也回不了，直接吞掉
+ * - 40060 Already acknowledged：代表已回應過，避免再回造成連鎖錯誤
+ */
+function isIgnorableDiscordInteractionError(err) {
+  return err?.code === 10062 || err?.code === 40060;
+}
+
 /* ===============================
    Interaction handler
 ================================ */
 client.on("interactionCreate", async (interaction) => {
   try {
-    /* /setup_leave_button */
+    // 1) /setup_leave_button：先回覆操作者（ephemeral），再在頻道送出按鈕訊息
     if (
       interaction.isChatInputCommand() &&
       interaction.commandName === "setup_leave_button"
     ) {
+      // ✅ 先搶回覆，避免任何延遲導致 Unknown interaction
       await interaction.reply({
         content: "✅ 已在此頻道建立請假按鈕",
         flags: MessageFlags.Ephemeral,
@@ -145,20 +155,15 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    /* Button -> Modal（3 秒內一定要） */
+    // 2) Button -> Modal：3 秒內一定要 showModal，這裡不要做其他 await
     if (interaction.isButton() && interaction.customId === "leave_button") {
       await interaction.showModal(buildLeaveModal());
       return;
     }
 
-    /* Modal submit */
-    if (
-      interaction.isModalSubmit() &&
-      interaction.customId === "leave_modal"
-    ) {
-      await interaction.deferReply({
-        flags: MessageFlags.Ephemeral,
-      });
+    // 3) Modal Submit：先 deferReply（搶 3 秒），再做送頻道/回覆
+    if (interaction.isModalSubmit() && interaction.customId === "leave_modal") {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
       const dates = safeGet(interaction, "leave_dates");
       const reason = safeGet(interaction, "leave_reason");
@@ -177,16 +182,14 @@ client.on("interactionCreate", async (interaction) => {
 
       const leaveChannelId = process.env.LEAVE_CHANNEL_ID;
       if (!leaveChannelId) {
-        await interaction.editReply("❌ 未設定 LEAVE_CHANNEL_ID");
+        await interaction.editReply("❌ 未設定 LEAVE_CHANNEL_ID（Render 環境變數）");
         return;
       }
 
-      const channel = await client.channels
-        .fetch(leaveChannelId)
-        .catch(() => null);
+      const channel = await client.channels.fetch(leaveChannelId).catch(() => null);
 
       if (!channel || !channel.isTextBased()) {
-        await interaction.editReply("❌ 請假頻道不存在或不是文字頻道");
+        await interaction.editReply("❌ 請假頻道不存在/不是文字頻道（LEAVE_CHANNEL_ID 可能錯）");
         return;
       }
 
@@ -195,19 +198,25 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
   } catch (err) {
+    // ✅ 關鍵保護：互動過期/已回應過 → 直接忽略，不要狂噴錯誤、也不要再回
+    if (isIgnorableDiscordInteractionError(err)) {
+      console.warn(`⚠️ Ignored interaction error: code=${err.code}`);
+      return;
+    }
+
     console.error("❌ interaction error:", err);
 
-    if (
-      interaction.isRepliable() &&
-      !interaction.replied &&
-      !interaction.deferred
-    ) {
+    // ✅ 保底回覆：只在「還沒回」時才回
+    if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
       await interaction
         .reply({
           content: "❌ 發生錯誤，請稍後再試",
           flags: MessageFlags.Ephemeral,
         })
         .catch(() => {});
+    } else if (interaction.isRepliable() && interaction.deferred) {
+      // defer 了但後面炸了，盡量 editReply（避免使用者卡住）
+      await interaction.editReply("❌ 發生錯誤，請稍後再試").catch(() => {});
     }
   }
 });
