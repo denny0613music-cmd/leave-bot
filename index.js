@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import http from 'http';
 import {
   Client, GatewayIntentBits,
   SlashCommandBuilder, REST, Routes,
@@ -6,6 +7,18 @@ import {
   ModalBuilder, TextInputBuilder, TextInputStyle,
   EmbedBuilder
 } from 'discord.js';
+
+/**
+ * ✅ Render Web Service 需要有開 Port，不然會被判定失敗停掉
+ * 這段不影響 Discord Bot，只是回傳 ok 讓 Render 健康檢查通過
+ */
+const port = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('ok');
+}).listen(port, () => {
+  console.log(`HTTP server listening on ${port}`);
+});
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -54,7 +67,6 @@ client.on('interactionCreate', async (interaction) => {
       .setTitle('請假表單');
 
     modal.addComponents(
-      
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
           .setCustomId('leave_dates')
@@ -87,7 +99,6 @@ client.on('interactionCreate', async (interaction) => {
       .setTitle('📌 新的請假申請')
       .addFields(
         { name: '申請人', value: `${interaction.user}` },
-       
         { name: '時間', value: interaction.fields.getTextInputValue('leave_dates') },
         { name: '原因', value: interaction.fields.getTextInputValue('leave_reason') },
         { name: '備註', value: interaction.fields.getTextInputValue('leave_note') || '（無）' }
