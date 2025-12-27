@@ -377,6 +377,194 @@ function buildUserPrompt({ authorName, userText, history }) {
   return lines.join("\n");
 }
 
+/* ===============================
+   FF14 專業模式（查證資料，避免胡說）
+   ✅ 偵測 FF14 問題 → 先用 XIVAPI 抓可查證資料，再交給 Gemini 回答
+   ✅ 只做「加強正確性」：不影響其他架構/功能
+================================ */
+
+// FF14 關鍵字偵測（寧可多抓一點，也不要漏）
+function isFF14Query(text) {
+  const t = (text || "").toLowerCase();
+  if (!t.trim()) return false;
+  const patterns = [
+    /ff14|ffxiv|final\s*fantasy\s*xiv/i,
+    /最終幻想\s*14|最终幻想\s*14/i,
+    /曉月|晓月|Endwalker|EW/i,
+    /漆黑|Shadowbringers|ShB/i,
+    /紅蓮|Stormblood|SB/i,
+    /蒼天|Heavensward|HW/i,
+    /重生|A\s*Realm\s*Reborn|ARR/i,
+    /主線|主线|任務|任务|副本|團本|讨伐|討伐|極|绝|零式|绝本|裝備|装备|素材|採集|采集|生產|生产/i,
+  ];
+  return patterns.some((re) => re.test(t));
+}
+
+// HTTP fetch with timeout（避免卡住）
+async function fetchJsonWithTimeout(url, ms = 4500) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    const resp = await fetch(url, {
+      method: "GET",
+      signal: controller.signal,
+      headers: { "User-Agent": "discord-ff14-bot/1.0" },
+    });
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 短快取：同樣問題 10 分鐘內不要一直打 XIVAPI
+const ff14FactCache = new Map(); // key -> { ts, text }
+const FF14_FACT_CACHE_MS = 10 * 60 * 1000;
+
+function pick(obj, keys) {
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return v;
+  }
+  return "";
+}
+
+// 灰機 Wiki（ff14.huijiwiki.com）作為 FF14 主要資料來源：用 MediaWiki API 取摘要（先引用它，再補 XIVAPI）
+// - 只取導言摘要，避免塞太長內容
+// - 找不到才回空字串
+const HUIJI_API = "https://ff14.huijiwiki.com/api.php";
+
+// HTTP text fetch with timeout（避免卡住）
+async function fetchTextWithTimeout(url, ms = 4500) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    const resp = await fetch(url, {
+      method: "GET",
+      signal: controller.signal,
+      headers: { "User-Agent": "discord-ff14-bot/1.0" },
+    });
+    if (!resp.ok) return "";
+    return await resp.text();
+  } catch {
+    return "";
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function buildHuijiFactPack(query) {
+  const q = (query || "").trim();
+  if (!q) return { title: "", url: "", extract: "" };
+
+  // 1) 先用 MediaWiki search 找最接近的頁面
+  const searchUrl =
+    `${HUIJI_API}?` +
+    `action=query&list=search&srsearch=${encodeURIComponent(q)}&srlimit=2&srprop=&format=json&formatversion=2`;
+  const search = await fetchJsonWithTimeout(searchUrl);
+  const hit = Array.isArray(search?.query?.search) ? search.query.search[0] : null;
+  const title = hit?.title ? String(hit.title) : "";
+  if (!title) return { title: "", url: "", extract: "" };
+
+  // 2) 取導言純文字摘要 + 頁面 URL
+  const infoUrl =
+    `${HUIJI_API}?` +
+    `action=query&prop=extracts|info&titles=${encodeURIComponent(title)}` +
+    `&exintro=1&explaintext=1&inprop=url&format=json&formatversion=2`;
+  const info = await fetchJsonWithTimeout(infoUrl);
+  const page = Array.isArray(info?.query?.pages) ? info.query.pages[0] : null;
+
+  const url = page?.fullurl ? String(page.fullurl) : "";
+  let extract = page?.extract ? String(page.extract) : "";
+  extract = extract.replace(/\s+/g, " ").trim();
+
+  // 限制長度（避免 prompt 太肥）
+  const MAX_CHARS = 650;
+  if (extract.length > MAX_CHARS) extract = extract.slice(0, MAX_CHARS) + "…";
+
+  return { title, url, extract };
+}
+
+
+// 組裝「已查證資料」：只提供能從 XIVAPI 取得的事實
+async function buildFF14FactPack(userText) {
+  const q = (userText || "").trim();
+  if (!isFF14Query(q)) return { isFF14: false, factText: "" };
+
+  const cacheKey = q.toLowerCase();
+  const cached = ff14FactCache.get(cacheKey);
+  const now = Date.now();
+  if (cached && now - cached.ts < FF14_FACT_CACHE_MS) {
+    return { isFF14: true, factText: cached.text || "" };
+  }
+
+  const lines = [];
+
+  // 先引用灰機 Wiki（中文）：用摘要提供「人類常用名稱」的對應線索
+  const huiji = await buildHuijiFactPack(q);
+  if (huiji?.title) {
+    lines.push(`【灰機 Wiki】${huiji.title}${huiji.url ? ` | ${huiji.url}` : ""}`);
+    if (huiji.extract) lines.push(huiji.extract);
+  }
+
+  // 再用 XIVAPI 補「可查證欄位」：Patch / Level / 類型 等
+  const encoded = encodeURIComponent(q);
+  const searchUrl = `https://xivapi.com/search?string=${encoded}&indexes=Quest,Item&limit=3&language=en`;
+  const search = await fetchJsonWithTimeout(searchUrl);
+
+  const results = Array.isArray(search?.Results) ? search.Results : [];
+  if (!results.length) {
+    const factText = lines.join("\n").trim();
+    ff14FactCache.set(cacheKey, { ts: now, text: factText });
+    return { isFF14: true, factText };
+  }
+  // 只取前幾筆，並補抓詳細資料（盡量拿到 Patch/Level 等可驗證欄位）
+  for (const r of results.slice(0, 3)) {
+    const index = pick(r, ["_index", "Index", "index"]) || "";
+    const id = pick(r, ["ID", "Id", "id"]) || "";
+    const name = pick(r, ["Name", "name"]) || "";
+    if (!index || !id) continue;
+
+    const detailUrl = `https://xivapi.com/${encodeURIComponent(index)}/${encodeURIComponent(id)}?language=en`;
+    const detail = await fetchJsonWithTimeout(detailUrl);
+
+    if (String(index).toLowerCase() === "quest") {
+      const patch = pick(detail, ["Patch"]) || pick(r, ["Patch"]);
+      const level = pick(detail, ["ClassJobLevel", "Level", "level"]);
+      const journalGenre = pick(detail?.JournalGenre, ["Name"]) || "";
+      const expansion = pick(detail?.Expansion, ["Name"]) || "";
+      lines.push(
+        `• [Quest] ${name || "(no name)"} (ID: ${id})` +
+          (patch ? ` | Patch: ${patch}` : "") +
+          (level ? ` | Lv: ${level}` : "") +
+          (expansion ? ` | Expansion: ${expansion}` : "") +
+          (journalGenre ? ` | Type: ${journalGenre}` : "")
+      );
+    } else if (String(index).toLowerCase() === "item") {
+      const itemLevel = pick(detail, ["LevelItem", "ItemLevel"]);
+      const equipLevel = pick(detail, ["LevelEquip"]);
+      const category = pick(detail?.ItemUICategory, ["Name"]) || "";
+      const patch = pick(detail, ["Patch"]);
+      lines.push(
+        `• [Item] ${name || "(no name)"} (ID: ${id})` +
+          (patch ? ` | Patch: ${patch}` : "") +
+          (itemLevel ? ` | iLv: ${itemLevel}` : "") +
+          (equipLevel ? ` | Equip Lv: ${equipLevel}` : "") +
+          (category ? ` | Category: ${category}` : "")
+      );
+    } else {
+      lines.push(`• [${index}] ${name || "(no name)"} (ID: ${id})`);
+    }
+  }
+
+  const factText = lines.join("\n").trim();
+  ff14FactCache.set(cacheKey, { ts: now, text: factText });
+  return { isFF14: true, factText };
+}
+
+
 async function listModelsViaHttp() {
   if (!GEMINI_API_KEY) return [];
   const endpoints = [
@@ -477,7 +665,27 @@ async function askGemini({ authorName, userText, userId }) {
   }
 
   const history = convoMemory.get(userId) || [];
-  const prompt = buildUserPrompt({ authorName, userText, history });
+  const basePrompt = buildUserPrompt({ authorName, userText, history });
+
+  // ✅ FF14 問題：先抓可查證資料，並強制模型「不確定就說不確定」
+  const ff14 = await buildFF14FactPack(userText);
+  let prompt = basePrompt;
+
+  if (ff14?.isFF14) {
+    const guard = [
+      "【FF14 專業回答要求（務必遵守）】",
+      "你現在正在回答 Final Fantasy XIV（FF14）相關問題。",
+      "你必須以可查證的事實作答；禁止猜測、腦補、混版本或把不同資料片內容混在一起。",
+      "若你無法從『使用者訊息』或下方『已查證資料』100% 確認細節，就要明確說「我無法確認」，並提出你需要的資訊（例如：任務/物品英文名、NPC、地點、任務ID、截圖上的關鍵字）。",
+      "回答請條列、精確，並在能確認時標明：版本（Patch）、資料片（Expansion）、類型（主線/支線/職業/副本）。",
+    ].join("\n");
+
+    const facts = ff14.factText
+      ? ff14.factText
+      : "（查無直接匹配資料；請向使用者追問更多可辨識資訊，例如任務英文名、NPC、地點、任務ID）";
+
+    prompt = `${guard}\n\n${basePrompt}\n\n【FF14 參考資料（灰機Wiki摘要 + XIVAPI欄位）】\n${facts}\n`;
+  }
 
   // 第一次嘗試（用已解析/預設模型）
   try {
