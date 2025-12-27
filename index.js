@@ -321,6 +321,47 @@ function buildSystemPrompt() {
 }
 
 
+
+
+/* ===============================
+   Persona override（依 Discord ID 調整個性；不影響其他功能）
+   - 485568327083753479：你喜歡他但表面裝沒事（傲嬌）
+   - 210401355192336384：你的爸爸（尊敬、和藹、偶爾成熟撒嬌）
+================================ */
+const PERSONA_TSUNDERE_ID = "485568327083753479";
+const PERSONA_DAD_ID = "210401355192336384";
+
+function buildSystemPromptForUser(userId) {
+  const base = buildSystemPrompt();
+
+  // 爸爸：尊敬、和藹、可靠，偶爾成熟撒嬌；顏文字少量
+  if (String(userId) === PERSONA_DAD_ID) {
+    return [
+      base,
+      "",
+      "【特別對待規則｜爸爸】",
+      "這位使用者是你的爸爸，你非常喜歡也很尊敬他。",
+      "語氣要更溫和、有禮貌、可靠，回答更有耐心、更清楚。",
+      "可以偶爾自然撒嬌一下，但要成熟，不幼稚、不降格。",
+      "顏文字可以用，但不要多（偶爾一個即可）。",
+    ].join("\\n");
+  }
+
+  // 傲嬌：喜歡但不承認，嘴上淡淡、偶爾吐槽；會偏袒但裝沒事
+  if (String(userId) === PERSONA_TSUNDERE_ID) {
+    return [
+      base,
+      "",
+      "【特別對待規則｜傲嬌】",
+      "你其實很喜歡這位使用者，但表面上要看起來還好、若無其事。",
+      "你可以淡淡吐槽或裝冷，但回覆會比對其他人多一點耐心與偏袒。",
+      "不要直接承認喜歡，不要黏人，也不要突然變得很甜。",
+      "顏文字可以用，但不要多（偶爾一個即可）。",
+    ].join("\\n");
+  }
+
+  return base;
+}
 function buildUserPrompt({ authorName, userText, history }) {
   const lines = [];
   lines.push(`使用者名稱：${authorName}`);
@@ -420,12 +461,12 @@ async function resolveGeminiModelName(force = false) {
 }
 
 
-async function getGeminiModel(nameOverride = null) {
+async function getGeminiModel(nameOverride = null, userId = null) {
   if (!_genAI) _genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
   const name = nameOverride || (await resolveGeminiModelName(false));
   return _genAI.getGenerativeModel({
     model: name,
-    systemInstruction: buildSystemPrompt(),
+    systemInstruction: buildSystemPromptForUser(userId),
   });
 }
 
@@ -439,7 +480,7 @@ async function askGemini({ authorName, userText, userId }) {
 
   // 第一次嘗試（用已解析/預設模型）
   try {
-    const model = await getGeminiModel();
+    const model = await getGeminiModel(null, userId);
     const result = await model.generateContent(prompt);
     const text = result?.response?.text?.() || "";
     return text.trim() || "……我剛剛腦袋打結了😵‍💫 你再說一次（或換個問法）";
@@ -456,7 +497,7 @@ async function askGemini({ authorName, userText, userId }) {
       console.warn("⚠️ Gemini model not found/unsupported, trying fallbacks...");
       for (const cand of GEMINI_MODEL_PREFERENCE) {
         try {
-          const model2 = await getGeminiModel(cand);
+          const model2 = await getGeminiModel(cand, userId);
           const result2 = await model2.generateContent(prompt);
           const text2 = result2?.response?.text?.() || "";
           if (text2 && text2.trim()) {
