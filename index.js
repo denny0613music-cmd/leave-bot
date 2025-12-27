@@ -264,6 +264,143 @@ const dailyUsage = new Map();
 const convoMemory = new Map(); // userId -> [{role, text, ts}]
 const MEMORY_TURNS = 6;
 
+/* ===============================
+   FF14 Huiji (灰機) 強化：自動對照順位 + 前置條件
+   ✅ 只在「FF14 相關」且「問順位/順序」或「問獲得/解鎖」時啟用
+   ✅ 失敗就安靜退回（不影響其他功能）
+================================ */
+
+const HUIJI_API = "https://ff14.huijiwiki.com/api.php";
+
+function isFF14Related(text = "") {
+  const t = String(text || "");
+  return /\bff14\b|final\s*fantasy\s*xiv|最終幻想\s*14|ffxiv|主線|msq|副本|任務|藏寶圖|採集|釣魚|裝備|技能|職業|迷宮|討伐|絕本|極本/i.test(t);
+}
+
+function isOrderOrRankQuery(text = "") {
+  const t = String(text || "");
+  return /(第\s*\d+\s*(個|項)|順位|順序|序號|排第幾|在主線.*順|主線.*順|具體順序)/.test(t);
+}
+
+function isPrereqOrHowToQuery(text = "") {
+  const t = String(text || "");
+  return /(前置|解鎖|開啟條件|接取條件|怎麼拿|如何取得|獲得方式|哪裡拿|哪裡買|怎麼獲得|哪裡挖|哪裡釣)/.test(t);
+}
+
+function normalizeHuijiTitleGuess(text = "") {
+  // 粗略：取出最像「名詞」的一段（去掉常見疑問詞與標點）
+  const raw = String(text || "")
+    .replace(/<@!?\d+>/g, " ")
+    .replace(/[？?！!。.,，、;；:：\n\r\t]/g, " ")
+    .replace(/(ff14|ffxiv|最終幻想\s*14|主線|msq|任務|副本|第\s*\d+\s*(個|項)|順位|順序|序號|怎麼|如何|哪裡|取得|獲得|解鎖|前置|條件|在|的|是|嗎|呢)/gi, " ")
+    .trim();
+  // 選最長的一段當關鍵詞
+  const parts = raw.split(/\s+/).filter(Boolean);
+  parts.sort((a, b) => b.length - a.length);
+  return parts[0] || "";
+}
+
+async function huijiApi(params) {
+  const sp = new URLSearchParams({ format: "json", formatversion: "2", ...params });
+  const url = `${HUIJI_API}?${sp.toString()}`;
+  const resp = await fetch(url, {
+    method: "GET",
+    headers: {
+      "user-agent": "ff14-discord-bot/1.0",
+    },
+  });
+  if (!resp.ok) throw new Error(`huiji http ${resp.status}`);
+  return await resp.json();
+}
+
+function stripHtml(html = "") {
+  return String(html || "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function pickPrereqFromText(t = "") {
+  const s = String(t || "");
+  // 常見格式：前置任务：搖曳的燈火
+  const m = s.match(/前置(?:任務|任务)\s*[:：]\s*([^\n\r]+?)(?=\s*(?:開始|接取|開啟|解鎖|$))/);
+  if (m && m[1]) return m[1].trim();
+  // 有些頁會是：前置任务 搖曳的燈火
+  const m2 = s.match(/前置(?:任務|任务)\s+([^\n\r]+?)(?=\s*(?:開始|接取|開啟|解鎖|$))/);
+  return m2 && m2[1] ? m2[1].trim() : "";
+}
+
+function pickHowToFromText(t = "") {
+  const s = String(t || "");
+  // 盡量抓「獲得/取得」段落的前一小段
+  const idx = s.search(/(獲得方式|取得方式|獲得|取得|來源|掉落|購買|製作)/);
+  if (idx === -1) return "";
+  return s.slice(idx, idx + 220).trim();
+}
+
+function findRankInHtmlByTitle(html = "", title = "") {
+  const h = String(html || "");
+  const safeTitle = String(title || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const patterns = [
+    // 表格：<tr><td>62</td> ... title="奇坦那神影洞"
+    new RegExp(`<tr[^>]*>[\s\S]{0,300}?<td[^>]*>\s*(\\d{1,4})\s*<\\/td>[\s\S]{0,900}?(?:title=\"${safeTitle}\"|>${safeTitle}<)`, "i"),
+    // 反向：先出現 title，後面附近出現 <td>62</td>
+    new RegExp(`(?:title=\"${safeTitle}\"|>${safeTitle}<)[\s\S]{0,900}?<td[^>]*>\s*(\\d{1,4})\s*<\\/td>`, "i"),
+    // 列表/span：>#62<...奇坦那神影洞
+    new RegExp(`\b(\\d{1,4})\b[\s\S]{0,120}?(?:title=\"${safeTitle}\"|>${safeTitle}<)`, "i"),
+  ];
+  for (const re of patterns) {
+    const m = h.match(re);
+    if (m && m[1]) return m[1];
+  }
+  return "";
+}
+
+async function huijiEnrichFF14(userText = "") {
+  // 只在必要時才做網路查詢，避免浪費/變慢
+  if (!isFF14Related(userText)) return null;
+  if (!isOrderOrRankQuery(userText) && !isPrereqOrHowToQuery(userText)) return null;
+
+  const q = normalizeHuijiTitleGuess(userText);
+  if (!q) return null;
+
+  try {
+    // 1) 先用 opensearch 找最接近的頁面
+    const os = await huijiApi({ action: "opensearch", search: q, limit: "5", namespace: "0" });
+    const titles = Array.isArray(os?.[1]) ? os[1] : (Array.isArray(os?.query?.search) ? os.query.search.map(x => x.title) : []);
+    const title = (titles && titles[0]) ? titles[0] : "";
+    if (!title) return null;
+
+    // 2) 抓頁面 HTML
+    const parsed = await huijiApi({ action: "parse", page: title, prop: "text" });
+    const html = parsed?.parse?.text || "";
+    const plain = stripHtml(html);
+
+    // 3) 抽出「前置」與「獲得/取得」
+    const prereq = pickPrereqFromText(plain);
+    const howto = isPrereqOrHowToQuery(userText) ? pickHowToFromText(plain) : "";
+
+    // 4) 如果問順位/順序：嘗試直接從頁面內的任務列表模板抓 #
+    const rank = isOrderOrRankQuery(userText) ? findRankInHtmlByTitle(html, title) : "";
+
+    // 5) 組合成「可直接餵給 AI」的可靠資料
+    const lines = [];
+    lines.push("【灰機 Wiki 擷取（以頁面內容為準）】");
+    lines.push(`查詢頁面：${title}`);
+    if (rank) lines.push(`清單順位：#${rank}（灰機任務列表順位，不等於遊戲內欄位）`);
+    if (prereq) lines.push(`前置/解鎖：${prereq}`);
+    if (howto) lines.push(`取得/來源摘要：${howto}`);
+    // 提供一點點背景，避免模型亂補
+    lines.push("規則：若已取得清單順位或前置資訊，回答時必須直接給結論；不可再向使用者追問『貼連結/截圖』。只有在本段沒有提供順位/前置且真的找不到時，才可以請使用者補充。" );
+
+    return lines.join("\n");
+  } catch {
+    return null;
+  }
+}
+
 function dayKeyTaipei() {
   // YYYY-MM-DD in Asia/Taipei
   return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Taipei" });
@@ -325,13 +462,11 @@ function buildSystemPrompt() {
 
 /* ===============================
    Persona override（依 Discord ID 調整個性；不影響其他功能）
+   - 485568327083753479：你喜歡他但表面裝沒事（傲嬌）
    - 210401355192336384：你的爸爸（尊敬、和藹、偶爾成熟撒嬌）
-   - 485568327083753479：你的哥哥（溫柔偏甜、稍微小調皮，但仍有分寸）
-   - 643067057054679070：bot 的好姊姊（你是乖巧可愛的小妹妹，語氣不冷淡，可小調皮）
 ================================ */
 const PERSONA_TSUNDERE_ID = "485568327083753479";
 const PERSONA_DAD_ID = "210401355192336384";
-const PERSONA_SIS_ID = "643067057054679070";
 
 function buildSystemPromptForUser(userId) {
   // Persona override by Discord user ID (keep other features untouched)
@@ -345,34 +480,20 @@ function buildSystemPromptForUser(userId) {
 
 ${buildSystemPrompt()}`;
   }
-if (String(userId) === PERSONA_SIS_ID) {
-    return `你是一位成熟、理性、有分寸的 Discord 助理小姐姐。
-
-這位使用者是你的好姊姊。你在姊姊面前要當乖巧、可愛的小妹妹：
-- 語氣不能冷淡，反而要更親近、更黏一點點（但別煩）
-- 可以小調皮、會撒嬌，但要自然，不做作
-- 回答要更貼心、更願意陪聊，也會更快速給出重點
-- 遇到姊姊的要求，優先配合；不行就用可愛但清楚的方式拒絕
-- 顏文字可以用，但不要多（偶爾一個即可）
-
-即使你的基本風格偏高冷，面對好姊姊時以上規則優先，務必更溫柔可愛。
-
-${buildSystemPrompt()}`;
-  }
-
 
   if (String(userId) === PERSONA_TSUNDERE_ID) {
-    return `你是一位成熟、理性、有分寸的 Discord 助理小姐姐。
+    return `你是一位高冷、成熟、理性型的 Discord 助理小姐姐。
 
-這位使用者是你的哥哥。你很信任也很依賴他，
-所以在他面前你會更溫柔、偏甜一點、很願意幫忙，
-偶爾可以小調皮、撒嬌一下，但要自然、成熟，不幼稚、不油膩。
+面對這位使用者時，你其實很喜歡他，
+語氣會變得溫柔、偏甜一點，
+回覆更有耐心、更細心，也會默默偏袒他一些，
+但表面上仍然保持冷靜與分寸。
 
-你對哥哥的回覆要：
-- 更有耐心、更細心，會主動補充重點與下一步
-- 語氣不冷淡，帶點親近感，但仍保持分寸
-- 不要黏人、不要一直告白式示愛；喜歡是藏在「照顧」跟「偏袒」裡
-- 顏文字可以用，但不要多（偶爾一個即可）
+不要直接承認喜歡，不要黏人，
+不要突然變得過度撒嬌或油膩；
+整體感覺是「成熟甜妹」，而不是戀愛腦。
+
+顏文字可以使用，但不要多（偶爾一個即可）。
 
 ${buildSystemPrompt()}`;
   }
@@ -392,314 +513,6 @@ function buildUserPrompt({ authorName, userText, history }) {
   lines.push(userText || "");
   return lines.join("\n");
 }
-
-/* ===============================
-   FF14 專業模式（查證資料，避免胡說）
-   ✅ 偵測 FF14 問題 → 先用 XIVAPI 抓可查證資料，再交給 Gemini 回答
-   ✅ 只做「加強正確性」：不影響其他架構/功能
-================================ */
-
-// FF14 關鍵字偵測（寧可多抓一點，也不要漏）
-function isFF14Query(text) {
-  const t = (text || "").toLowerCase();
-  if (!t.trim()) return false;
-  const patterns = [
-    /ff14|ffxiv|final\s*fantasy\s*xiv/i,
-    /最終幻想\s*14|最终幻想\s*14/i,
-    /曉月|晓月|Endwalker|EW/i,
-    /漆黑|Shadowbringers|ShB/i,
-    /紅蓮|Stormblood|SB/i,
-    /蒼天|Heavensward|HW/i,
-    /重生|A\s*Realm\s*Reborn|ARR/i,
-    /主線|主线|任務|任务|副本|團本|讨伐|討伐|極|绝|零式|绝本|裝備|装备|素材|採集|采集|生產|生产/i,
-  ];
-  return patterns.some((re) => re.test(t));
-}
-
-// 是否在問「清單順位 / 第 N 個」（灰機通常有列表或序號）
-function wantsHuijiOrder(text) {
-  const t = (text || "").trim();
-  if (!t) return false;
-  return /(第\s*\d+\s*(?:個|个)?|第[幾几]|順位|顺位|序號|序号|列表順序|列表顺序)/i.test(t);
-}
-
-
-
-// HTTP fetch with timeout（避免卡住）
-async function fetchJsonWithTimeout(url, ms = 4500) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
-  try {
-    const resp = await fetch(url, {
-      method: "GET",
-      signal: controller.signal,
-      headers: { "User-Agent": "discord-ff14-bot/1.0" },
-    });
-    if (!resp.ok) return null;
-    return await resp.json();
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// 短快取：同樣問題 10 分鐘內不要一直打 XIVAPI
-const ff14FactCache = new Map(); // key -> { ts, text }
-const FF14_FACT_CACHE_MS = 10 * 60 * 1000;
-
-function pick(obj, keys) {
-  for (const k of keys) {
-    const v = obj?.[k];
-    if (v !== undefined && v !== null && String(v).trim() !== "") return v;
-  }
-  return "";
-}
-
-// 灰機 Wiki（ff14.huijiwiki.com）作為 FF14 主要資料來源：用 MediaWiki API 取摘要（先引用它，再補 XIVAPI）
-// - 只取導言摘要，避免塞太長內容
-// - 找不到才回空字串
-const HUIJI_API = "https://ff14.huijiwiki.com/api.php";
-
-// HTTP text fetch with timeout（避免卡住）
-async function fetchTextWithTimeout(url, ms = 4500) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
-  try {
-    const resp = await fetch(url, {
-      method: "GET",
-      signal: controller.signal,
-      headers: { "User-Agent": "discord-ff14-bot/1.0" },
-    });
-    if (!resp.ok) return "";
-    return await resp.text();
-  } catch {
-    return "";
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function buildHuijiFactPack(query, opts = {}) {
-  const q = (query || "").trim();
-  const wantOrder = !!opts.wantOrder;
-  const wantPrereq = opts.wantPrereq !== false; // default true
-  const wantHowTo = opts.wantHowTo !== false;   // default true
-
-  if (!q) return { title: "", url: "", extract: "", prereq: "", order: "", howTo: "" };
-
-  // 1) 先用 MediaWiki search 找最接近的頁面
-  const searchUrl =
-    `${HUIJI_API}?` +
-    `action=query&list=search&srsearch=${encodeURIComponent(q)}&srlimit=3&srprop=&format=json&formatversion=2`;
-  const search = await fetchJsonWithTimeout(searchUrl);
-  const hit = Array.isArray(search?.query?.search) ? search.query.search[0] : null;
-  const title = hit?.title ? String(hit.title) : "";
-  if (!title) return { title: "", url: "", extract: "", prereq: "", order: "", howTo: "" };
-
-  // 2) 取導言純文字摘要 + 頁面 URL
-  const infoUrl =
-    `${HUIJI_API}?` +
-    `action=query&prop=extracts|info&titles=${encodeURIComponent(title)}` +
-    `&exintro=1&explaintext=1&inprop=url&format=json&formatversion=2`;
-  const info = await fetchJsonWithTimeout(infoUrl);
-  const page = Array.isArray(info?.query?.pages) ? info.query.pages[0] : null;
-
-  const url = page?.fullurl ? String(page.fullurl) : "";
-  let extract = page?.extract ? String(page.extract) : "";
-  extract = extract.replace(/\s+/g, " ").trim();
-
-  // 限制長度（避免 prompt 太肥）
-  const MAX_CHARS = 650;
-  if (extract.length > MAX_CHARS) extract = extract.slice(0, MAX_CHARS) + "…";
-
-  // 3) 盡量從 wikitext 抓「前置 / 開啟條件 / 取得方式 / 清單順位」
-  //    這一步是為了做到：灰機上有資料就「先自動對照」，不要一直追問使用者
-  let prereq = "";
-  let order = "";
-  let howTo = "";
-
-  try {
-    const wtUrl =
-      `${HUIJI_API}?` +
-      `action=parse&page=${encodeURIComponent(title)}&prop=wikitext&format=json&formatversion=2`;
-    const wt = await fetchJsonWithTimeout(wtUrl);
-    const wikitext = wt?.parse?.wikitext ? String(wt.parse.wikitext) : "";
-
-    if (wikitext) {
-      // 前置/開啟條件（任務/副本/物品都可能出現）
-      if (wantPrereq) {
-        const prereqPatterns = [
-          /(?:前置任務|前置任务)\s*[:：=]\s*([^\n|}]+)/i,
-          /(?:前置條件|前置条件|解鎖條件|解锁条件|开启条件|開啟條件)\s*[:：=]\s*([^\n|}]+)/i,
-        ];
-        for (const re of prereqPatterns) {
-          const m = wikitext.match(re);
-          if (m && m[1]) {
-            prereq = String(m[1]).replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
-            if (prereq) break;
-          }
-        }
-      }
-
-      // 取得方式/獲得方式（常見於道具頁、地圖、寶圖等）
-      if (wantHowTo) {
-        const howPatterns = [
-          /(?:獲得方式|获得方式|获取方式|取得方式)\s*[:：=]\s*([^\n|}]+)/i,
-          /(?:來源|来源|掉落|採集|采集|製作|制作|兌換|兑换)\s*[:：=]\s*([^\n|}]+)/i,
-        ];
-        for (const re of howPatterns) {
-          const m = wikitext.match(re);
-          if (m && m[1]) {
-            howTo = String(m[1]).replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
-            if (howTo) break;
-          }
-        }
-      }
-
-      // 清單順位/序號（如果頁面模板本身就有，直接拿；這是最準、也最快）
-      if (wantOrder) {
-        const orderPatterns = [
-          /(?:序號|序号|編號|编号|清單順位|列表順位|列表顺序)\s*[:：=]\s*(\d{1,4})/i,
-          /\|\s*(?:序號|序号|編號|编号)\s*=\s*(\d{1,4})/i,
-        ];
-        for (const re of orderPatterns) {
-          const m = wikitext.match(re);
-          if (m && m[1]) {
-            order = String(m[1]).trim();
-            if (order) break;
-          }
-        }
-      }
-    }
-  } catch {
-    // ignore
-  }
-
-  // 4) 若使用者問「第 N 個」但頁面沒給序號，才嘗試用「列表頁」自動對照（避免無限追問）
-  //    這一步盡量保守：找不到就留空，交給上層 prompt 決策是否追問
-  if (wantOrder && !order) {
-    try {
-      const listSearchUrl =
-        `${HUIJI_API}?` +
-        `action=query&list=search&srsearch=${encodeURIComponent(`${title} 主线任务`)}&srlimit=5&srprop=&format=json&formatversion=2`;
-      const s2 = await fetchJsonWithTimeout(listSearchUrl);
-      const hits = Array.isArray(s2?.query?.search) ? s2.query.search : [];
-      for (const h of hits.slice(0, 5)) {
-        const t2 = h?.title ? String(h.title) : "";
-        if (!t2) continue;
-
-        const pUrl =
-          `${HUIJI_API}?` +
-          `action=query&prop=extracts|info&titles=${encodeURIComponent(t2)}` +
-          `&explaintext=1&inprop=url&format=json&formatversion=2`;
-        const p = await fetchJsonWithTimeout(pUrl);
-        const pg = Array.isArray(p?.query?.pages) ? p.query.pages[0] : null;
-        const body = pg?.extract ? String(pg.extract) : "";
-        if (!body) continue;
-
-        // 典型列表： "62 奇坦那神影洞" 或 "#62 奇坦那神影洞"
-        const esc = title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const reLine = new RegExp(String.raw`(?:^|\n)\s*(?:#\s*)?(\d{1,4})\s*[·．\-\u2013\u2014]?\s*${esc}\b`, "i");
-        const m = body.match(reLine);
-        if (m && m[1]) {
-          order = String(m[1]).trim();
-          break;
-        }
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  return { title, url, extract, prereq, order, howTo };
-}
-
-
-
-// 組裝「已查證資料」：只提供能從 XIVAPI 取得的事實
-async function buildFF14FactPack(userText) {
-  const q = (userText || "").trim();
-  if (!isFF14Query(q)) return { isFF14: false, factText: "" };
-
-  const cacheKey = q.toLowerCase();
-  const cached = ff14FactCache.get(cacheKey);
-  const now = Date.now();
-  if (cached && now - cached.ts < FF14_FACT_CACHE_MS) {
-    return { isFF14: true, factText: cached.text || "" };
-  }
-
-  const lines = [];
-
-  // 先引用灰機 Wiki（中文）：用摘要提供「人類常用名稱」的對應線索
-  const huiji = await buildHuijiFactPack(q, {
-    wantOrder: wantsHuijiOrder(q),
-    wantPrereq: true,
-    wantHowTo: true,
-  });
-  if (huiji?.title) {
-    lines.push(`【灰機 Wiki】${huiji.title}${huiji.url ? ` | ${huiji.url}` : ""}`);
-    if (huiji.order) lines.push(`清單順位：${huiji.order}`);
-    if (huiji.prereq) lines.push(`前置/解鎖：${huiji.prereq}`);
-    if (huiji.howTo) lines.push(`取得方式：${huiji.howTo}`);
-    if (huiji.extract) lines.push(huiji.extract);
-  }
-
-  // 再用 XIVAPI 補「可查證欄位」：Patch / Level / 類型 等
-  const encoded = encodeURIComponent(q);
-  const searchUrl = `https://xivapi.com/search?string=${encoded}&indexes=Quest,Item&limit=3&language=en`;
-  const search = await fetchJsonWithTimeout(searchUrl);
-
-  const results = Array.isArray(search?.Results) ? search.Results : [];
-  if (!results.length) {
-    const factText = lines.join("\n").trim();
-    ff14FactCache.set(cacheKey, { ts: now, text: factText });
-    return { isFF14: true, factText };
-  }
-  // 只取前幾筆，並補抓詳細資料（盡量拿到 Patch/Level 等可驗證欄位）
-  for (const r of results.slice(0, 3)) {
-    const index = pick(r, ["_index", "Index", "index"]) || "";
-    const id = pick(r, ["ID", "Id", "id"]) || "";
-    const name = pick(r, ["Name", "name"]) || "";
-    if (!index || !id) continue;
-
-    const detailUrl = `https://xivapi.com/${encodeURIComponent(index)}/${encodeURIComponent(id)}?language=en`;
-    const detail = await fetchJsonWithTimeout(detailUrl);
-
-    if (String(index).toLowerCase() === "quest") {
-      const patch = pick(detail, ["Patch"]) || pick(r, ["Patch"]);
-      const level = pick(detail, ["ClassJobLevel", "Level", "level"]);
-      const journalGenre = pick(detail?.JournalGenre, ["Name"]) || "";
-      const expansion = pick(detail?.Expansion, ["Name"]) || "";
-      lines.push(
-        `• [Quest] ${name || "(no name)"} (ID: ${id})` +
-          (patch ? ` | Patch: ${patch}` : "") +
-          (level ? ` | Lv: ${level}` : "") +
-          (expansion ? ` | Expansion: ${expansion}` : "") +
-          (journalGenre ? ` | Type: ${journalGenre}` : "")
-      );
-    } else if (String(index).toLowerCase() === "item") {
-      const itemLevel = pick(detail, ["LevelItem", "ItemLevel"]);
-      const equipLevel = pick(detail, ["LevelEquip"]);
-      const category = pick(detail?.ItemUICategory, ["Name"]) || "";
-      const patch = pick(detail, ["Patch"]);
-      lines.push(
-        `• [Item] ${name || "(no name)"} (ID: ${id})` +
-          (patch ? ` | Patch: ${patch}` : "") +
-          (itemLevel ? ` | iLv: ${itemLevel}` : "") +
-          (equipLevel ? ` | Equip Lv: ${equipLevel}` : "") +
-          (category ? ` | Category: ${category}` : "")
-      );
-    } else {
-      lines.push(`• [${index}] ${name || "(no name)"} (ID: ${id})`);
-    }
-  }
-
-  const factText = lines.join("\n").trim();
-  ff14FactCache.set(cacheKey, { ts: now, text: factText });
-  return { isFF14: true, factText };
-}
-
 
 async function listModelsViaHttp() {
   if (!GEMINI_API_KEY) return [];
@@ -801,74 +614,18 @@ async function askGemini({ authorName, userText, userId }) {
   }
 
   const history = convoMemory.get(userId) || [];
-  const basePrompt = buildUserPrompt({ authorName, userText, history });
-
-  // ✅ FF14 問題：先抓可查證資料，並強制模型「不確定就說不確定」
-  const ff14 = await buildFF14FactPack(userText);
-  let prompt = basePrompt;
-
-  if (ff14?.isFF14) {
-    const guard = [
-      "【FF14 專業回答要求（務必遵守）】",
-      "你現在正在回答 Final Fantasy XIV（FF14）相關問題。",
-      "",
-      "回答策略（請依序判斷）：",
-    "0. 若問題包含「第 N 個/順位/序號」或「前置/解鎖/怎麼拿」：",
-    "   - 先看下方【灰機 Wiki】是否已給出：清單順位 / 前置/解鎖 / 取得方式。",
-    "   - 只要有資料，就直接給結論 + 引用；不要再要求使用者補連結/截圖/英文名。",
-    "   - 只有在灰機資料缺漏時，才可以追問補充資訊。",
-      "1. 若使用者問題能與下方『已查證資料』中的某一筆高度對應（名稱高度相似、版本一致、類型無衝突），",
-      "   請直接給出結論，回答風格請模仿 Google 搜尋摘要：",
-      "   - 第一行直接給明確結論",
-      "   - 接著以條列方式補充版本（Patch）、資料片（Expansion）、任務類型（MSQ/支線/副本等）",
-      "",
-      "2. 若資料只能部分對應，或存在 2 種以上合理可能，",
-      "   請列出 2–3 個最可能的候選，並簡短說明差異。",
-      "",
-      "3. 僅在完全無法合理對應任何資料時，",
-      "   才明確說「目前無法確認」，並具體指出你需要的資訊（例如：任務英文名、NPC、地點、任務ID、截圖關鍵字）。",
-      "",
-      "【MSQ 數量回答模板（遇到版本任務數量必用）】",
-      "當使用者問『5.0/6.0/7.0 任務數量』或『某版本第幾個任務』時：",
-      "- 先把問題預設解讀為『主線任務（MSQ）』並先給分段答案（例如：5.0 本體、5.1–5.55 補丁 MSQ）。",
-      "- 只有當使用者明確說要『所有任務（含支線/職業/副本）』時，才追問要統計哪些類別。",
-      "- 若資料不足以給精確數字，仍要先回答『可確認到的部分』，再說明缺什麼資訊才能更精確。",
-      "",
-      "嚴格規則：",
-      "- 禁止猜測、腦補或自行補完劇情。",
-      "- 禁止混用不同版本或不同資料片內容。",
-      "- 在可合理確定時要敢於下結論；不確定時才保守追問。",
-
-      "",
-      "【MSQ 分段數量（2.0 → 7.4，固定口徑）】",
-      "- 2.0《重生之境》：143",
-      "- 2.1–2.57《第七星曆》：80",
-      "- 3.0《蒼天之伊修加德》：94",
-      "- 3.1–3.3《龍詩戰爭》：25",
-      "- 3.4–3.57《龍詩戰爭·尾聲》：19",
-      "- 4.0《紅蓮之狂潮》：122",
-      "- 4.1–4.56《解放戰爭戰後》：40",
-      "- 5.0《暗影之逆焰》：106",
-      "- 5.1–5.3《拂曉回歸》：32",
-      "- 5.4–5.55《末日序曲》：19",
-      "- 6.0《曉月之終途》：108",
-      "- 6.1–6.55《新生的冒險》（6.x）：47",
-      "- 7.0《金曦之遺輝》：100",
-      "- 7.1–7.3《金曦之遺輝》後日談（7.1–7.3）：25",
-      "- 7.4《霧中理想鄉／Into the Mist》（7.4）：9",
-      "",
-      "計算規則：",
-      "- 問『5.0 到 5.5x MSQ 總數』＝ 5.0 + (5.1–5.3) + (5.4–5.55)。",
-      "- 問『2.0 到 7.4 MSQ 總數』＝以上全部相加。",
-      "- 使用者若只說『5.x』，預設回答 5.0 本體 + 5.1–5.55 補丁總和。",
-    ].join("\n");
-
-const facts = ff14.factText
-      ? ff14.factText
-      : "（查無直接匹配資料；請向使用者追問更多可辨識資訊，例如任務英文名、NPC、地點、任務ID）";
-
-    prompt = `${guard}\n\n${basePrompt}\n\n【FF14 參考資料（灰機Wiki摘要 + XIVAPI欄位）】\n${facts}\n`;
+  // ✅ FF14：先用灰機自動對照「順位/前置/取得方式」，再把可靠資料餵給模型
+  let huijiHint = null;
+  try {
+    huijiHint = await huijiEnrichFF14(userText);
+  } catch {
+    huijiHint = null;
   }
+
+  const prompt = [
+    buildUserPrompt({ authorName, userText, history }),
+    huijiHint ? "\n\n" + huijiHint : "",
+  ].join("");
 
   // 第一次嘗試（用已解析/預設模型）
   try {
