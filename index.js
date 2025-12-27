@@ -357,7 +357,7 @@ function findRankInHtmlByTitle(html = "", title = "") {
   }
   return "";
 }
-fasync function huijiEnrichFF14(userText = "") {
+async function huijiEnrichFF14(userText = "") {
   // 只在必要時才做網路查詢，避免浪費/變慢
   if (!isFF14Related(userText)) return null;
   if (!isOrderOrRankQuery(userText) && !isPrereqOrHowToQuery(userText)) return null;
