@@ -332,9 +332,7 @@ const PERSONA_TSUNDERE_ID = "485568327083753479";
 const PERSONA_DAD_ID = "210401355192336384";
 
 function buildSystemPromptForUser(userId) {
-  // ✅ 只在這裡做「依 Discord ID 切換人格」；其他架構完全不動
-  // ✅ 用 template literal 避免 join("
-") 被編輯器弄壞造成語法錯
+  // Persona override by Discord user ID (keep other features untouched)
 
   if (String(userId) === PERSONA_DAD_ID) {
     return `你是一位高冷、成熟、理性型的 Discord 助理小姐姐。
