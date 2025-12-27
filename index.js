@@ -416,6 +416,15 @@ function isFF14Query(text) {
   return patterns.some((re) => re.test(t));
 }
 
+// 是否在問「清單順位 / 第 N 個」（灰機通常有列表或序號）
+function wantsHuijiOrder(text) {
+  const t = (text || "").trim();
+  if (!t) return false;
+  return /(第\s*\d+\s*(?:個|个)?|第[幾几]|順位|顺位|序號|序号|列表順序|列表顺序)/i.test(t);
+}
+
+
+
 // HTTP fetch with timeout（避免卡住）
 async function fetchJsonWithTimeout(url, ms = 4500) {
   const controller = new AbortController();
@@ -471,18 +480,22 @@ async function fetchTextWithTimeout(url, ms = 4500) {
   }
 }
 
-async function buildHuijiFactPack(query) {
+async function buildHuijiFactPack(query, opts = {}) {
   const q = (query || "").trim();
-  if (!q) return { title: "", url: "", extract: "" };
+  const wantOrder = !!opts.wantOrder;
+  const wantPrereq = opts.wantPrereq !== false; // default true
+  const wantHowTo = opts.wantHowTo !== false;   // default true
+
+  if (!q) return { title: "", url: "", extract: "", prereq: "", order: "", howTo: "" };
 
   // 1) 先用 MediaWiki search 找最接近的頁面
   const searchUrl =
     `${HUIJI_API}?` +
-    `action=query&list=search&srsearch=${encodeURIComponent(q)}&srlimit=2&srprop=&format=json&formatversion=2`;
+    `action=query&list=search&srsearch=${encodeURIComponent(q)}&srlimit=3&srprop=&format=json&formatversion=2`;
   const search = await fetchJsonWithTimeout(searchUrl);
   const hit = Array.isArray(search?.query?.search) ? search.query.search[0] : null;
   const title = hit?.title ? String(hit.title) : "";
-  if (!title) return { title: "", url: "", extract: "" };
+  if (!title) return { title: "", url: "", extract: "", prereq: "", order: "", howTo: "" };
 
   // 2) 取導言純文字摘要 + 頁面 URL
   const infoUrl =
@@ -500,8 +513,108 @@ async function buildHuijiFactPack(query) {
   const MAX_CHARS = 650;
   if (extract.length > MAX_CHARS) extract = extract.slice(0, MAX_CHARS) + "…";
 
-  return { title, url, extract };
+  // 3) 盡量從 wikitext 抓「前置 / 開啟條件 / 取得方式 / 清單順位」
+  //    這一步是為了做到：灰機上有資料就「先自動對照」，不要一直追問使用者
+  let prereq = "";
+  let order = "";
+  let howTo = "";
+
+  try {
+    const wtUrl =
+      `${HUIJI_API}?` +
+      `action=parse&page=${encodeURIComponent(title)}&prop=wikitext&format=json&formatversion=2`;
+    const wt = await fetchJsonWithTimeout(wtUrl);
+    const wikitext = wt?.parse?.wikitext ? String(wt.parse.wikitext) : "";
+
+    if (wikitext) {
+      // 前置/開啟條件（任務/副本/物品都可能出現）
+      if (wantPrereq) {
+        const prereqPatterns = [
+          /(?:前置任務|前置任务)\s*[:：=]\s*([^\n|}]+)/i,
+          /(?:前置條件|前置条件|解鎖條件|解锁条件|开启条件|開啟條件)\s*[:：=]\s*([^\n|}]+)/i,
+        ];
+        for (const re of prereqPatterns) {
+          const m = wikitext.match(re);
+          if (m && m[1]) {
+            prereq = String(m[1]).replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+            if (prereq) break;
+          }
+        }
+      }
+
+      // 取得方式/獲得方式（常見於道具頁、地圖、寶圖等）
+      if (wantHowTo) {
+        const howPatterns = [
+          /(?:獲得方式|获得方式|获取方式|取得方式)\s*[:：=]\s*([^\n|}]+)/i,
+          /(?:來源|来源|掉落|採集|采集|製作|制作|兌換|兑换)\s*[:：=]\s*([^\n|}]+)/i,
+        ];
+        for (const re of howPatterns) {
+          const m = wikitext.match(re);
+          if (m && m[1]) {
+            howTo = String(m[1]).replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+            if (howTo) break;
+          }
+        }
+      }
+
+      // 清單順位/序號（如果頁面模板本身就有，直接拿；這是最準、也最快）
+      if (wantOrder) {
+        const orderPatterns = [
+          /(?:序號|序号|編號|编号|清單順位|列表順位|列表顺序)\s*[:：=]\s*(\d{1,4})/i,
+          /\|\s*(?:序號|序号|編號|编号)\s*=\s*(\d{1,4})/i,
+        ];
+        for (const re of orderPatterns) {
+          const m = wikitext.match(re);
+          if (m && m[1]) {
+            order = String(m[1]).trim();
+            if (order) break;
+          }
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  // 4) 若使用者問「第 N 個」但頁面沒給序號，才嘗試用「列表頁」自動對照（避免無限追問）
+  //    這一步盡量保守：找不到就留空，交給上層 prompt 決策是否追問
+  if (wantOrder && !order) {
+    try {
+      const listSearchUrl =
+        `${HUIJI_API}?` +
+        `action=query&list=search&srsearch=${encodeURIComponent(`${title} 主线任务`)}&srlimit=5&srprop=&format=json&formatversion=2`;
+      const s2 = await fetchJsonWithTimeout(listSearchUrl);
+      const hits = Array.isArray(s2?.query?.search) ? s2.query.search : [];
+      for (const h of hits.slice(0, 5)) {
+        const t2 = h?.title ? String(h.title) : "";
+        if (!t2) continue;
+
+        const pUrl =
+          `${HUIJI_API}?` +
+          `action=query&prop=extracts|info&titles=${encodeURIComponent(t2)}` +
+          `&explaintext=1&inprop=url&format=json&formatversion=2`;
+        const p = await fetchJsonWithTimeout(pUrl);
+        const pg = Array.isArray(p?.query?.pages) ? p.query.pages[0] : null;
+        const body = pg?.extract ? String(pg.extract) : "";
+        if (!body) continue;
+
+        // 典型列表： "62 奇坦那神影洞" 或 "#62 奇坦那神影洞"
+        const esc = title.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const reLine = new RegExp(String.raw`(?:^|\n)\s*(?:#\s*)?(\d{1,4})\s*[·．\-\u2013\u2014]?\s*${esc}\b`, "i");
+        const m = body.match(reLine);
+        if (m && m[1]) {
+          order = String(m[1]).trim();
+          break;
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return { title, url, extract, prereq, order, howTo };
 }
+
 
 
 // 組裝「已查證資料」：只提供能從 XIVAPI 取得的事實
@@ -519,9 +632,16 @@ async function buildFF14FactPack(userText) {
   const lines = [];
 
   // 先引用灰機 Wiki（中文）：用摘要提供「人類常用名稱」的對應線索
-  const huiji = await buildHuijiFactPack(q);
+  const huiji = await buildHuijiFactPack(q, {
+    wantOrder: wantsHuijiOrder(q),
+    wantPrereq: true,
+    wantHowTo: true,
+  });
   if (huiji?.title) {
     lines.push(`【灰機 Wiki】${huiji.title}${huiji.url ? ` | ${huiji.url}` : ""}`);
+    if (huiji.order) lines.push(`清單順位：${huiji.order}`);
+    if (huiji.prereq) lines.push(`前置/解鎖：${huiji.prereq}`);
+    if (huiji.howTo) lines.push(`取得方式：${huiji.howTo}`);
     if (huiji.extract) lines.push(huiji.extract);
   }
 
@@ -693,6 +813,10 @@ async function askGemini({ authorName, userText, userId }) {
       "你現在正在回答 Final Fantasy XIV（FF14）相關問題。",
       "",
       "回答策略（請依序判斷）：",
+    "0. 若問題包含「第 N 個/順位/序號」或「前置/解鎖/怎麼拿」：",
+    "   - 先看下方【灰機 Wiki】是否已給出：清單順位 / 前置/解鎖 / 取得方式。",
+    "   - 只要有資料，就直接給結論 + 引用；不要再要求使用者補連結/截圖/英文名。",
+    "   - 只有在灰機資料缺漏時，才可以追問補充資訊。",
       "1. 若使用者問題能與下方『已查證資料』中的某一筆高度對應（名稱高度相似、版本一致、類型無衝突），",
       "   請直接給出結論，回答風格請模仿 Google 搜尋摘要：",
       "   - 第一行直接給明確結論",
