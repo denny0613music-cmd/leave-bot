@@ -332,7 +332,8 @@ const PERSONA_TSUNDERE_ID = "485568327083753479";
 const PERSONA_DAD_ID = "210401355192336384";
 
 function buildSystemPromptForUser(userId) {
-  // persona 只在這裡做最小覆蓋，其餘架構不動
+  // ✅ persona 只在這裡做最小覆蓋，其餘架構不動
+  // ✅ 先定義身份/關係，再附上通用規則，權重才穩定
 
   // 爸爸：尊敬、和藹、可靠，偶爾成熟撒嬌；顏文字少量
   if (String(userId) === PERSONA_DAD_ID) {
@@ -362,7 +363,6 @@ function buildSystemPromptForUser(userId) {
 ");
   }
 
-  // 其他人：原本的小姐姐基底
   return buildSystemPrompt();
 }
 function buildUserPrompt({ authorName, userText, history }) {
