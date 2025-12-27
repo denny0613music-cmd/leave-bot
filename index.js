@@ -724,9 +724,7 @@ async function askGemini({ authorName, userText, userId }) {
 
   const prompt = [
     buildUserPrompt({ authorName, userText, history }),
-    huiji?.hintText ? "
-
-" + huiji.hintText : "",
+    huiji?.hintText ? "\n\n" + huiji.hintText : "",
   ].join("");
 
   // 第一次嘗試（用已解析/預設模型）
