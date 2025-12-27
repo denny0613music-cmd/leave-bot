@@ -332,9 +332,7 @@ const PERSONA_TSUNDERE_ID = "485568327083753479";
 const PERSONA_DAD_ID = "210401355192336384";
 
 function buildSystemPromptForUser(userId) {
-  // ✅ 重要：先定義「身份/關係」再附上通用規則，權重才不會被稀釋
-  // ✅ 重要：使用 "
-" 真的換行（不要用 "\n" 變成字面字元）
+  // persona 只在這裡做最小覆蓋，其餘架構不動
 
   // 爸爸：尊敬、和藹、可靠，偶爾成熟撒嬌；顏文字少量
   if (String(userId) === PERSONA_DAD_ID) {
