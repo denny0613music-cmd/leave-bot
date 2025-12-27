@@ -298,8 +298,7 @@ function buildUserPrompt({ authorName, userText, history }) {
 
 async function askGemini({ authorName, userText, userId }) {
   if (!GEMINI_API_KEY) {
-    return "我現在腦袋還沒接上電（缺 GEMINI_API_KEY）😵‍💫
-叫管理員把環境變數補好啦～我才有魔力。";
+    return `我現在腦袋還沒接上電（缺 GEMINI_API_KEY）😵‍💫\n叫管理員把環境變數補好啦～我才有魔力。`;
   }
 
   const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
