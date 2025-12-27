@@ -215,14 +215,28 @@ function isIgnorableDiscordInteractionError(err) {
  */
 
 const AI_CHANNEL_ID = (process.env.AI_CHANNEL_ID || "").trim();
-const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || "").trim();
+const GEMINI_API_KEY = (
+  process.env.GEMINI_API_KEY ||
+  process.env.GEMINI_KEY ||
+  process.env.key ||
+  ""
+).trim();
 
 const AI_DAILY_LIMIT_PER_USER = Number(process.env.AI_DAILY_LIMIT_PER_USER || 20);
+
+// Startup diagnostics (helps on Render)
+if (AI_CHANNEL_ID && !GEMINI_API_KEY) {
+  console.warn("⚠️ AI_CHANNEL_ID is set but GEMINI_API_KEY is missing (set GEMINI_API_KEY in Render env vars)");
+}
 
 // ✅ Gemini 模型選擇：
 // - 優先使用環境變數 GEMINI_MODEL
 // - 若該模型不可用，會自動 fallback 到可用模型（避免 404）
-const GEMINI_MODEL_ENV = (process.env.GEMINI_MODEL || "").trim();
+const GEMINI_MODEL_ENV = (
+  process.env.GEMINI_MODEL ||
+  process.env["GEMINI_MODEL "] ||
+  ""
+).trim();
 const GEMINI_MODEL_PREFERENCE = [
   GEMINI_MODEL_ENV,              // 你手動指定的就先用（最穩）
   "gemini-1.0-pro",              // v1beta 保底
