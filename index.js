@@ -491,48 +491,9 @@ function buildHuijiHintForModel(data = {}) {
 
 
 
-async function huijiEnrichFF14(userText = "") {
-  // 只在必要時才做網路查詢，避免浪費/變慢
-  if (!isFF14Related(userText)) return null;
-  if (!isOrderOrRankQuery(userText) && !isPrereqOrHowToQuery(userText)) return null;
 
-  const q = normalizeHuijiTitleGuess(userText);
-  if (!q) return null;
 
-  try {
-    // 1) 先用 opensearch 找最接近的頁面
-    const os = await huijiApi({ action: "opensearch", search: q, limit: "5", namespace: "0" });
-    const titles = Array.isArray(os?.[1]) ? os[1] : (Array.isArray(os?.query?.search) ? os.query.search.map(x => x.title) : []);
-    const title = (titles && titles[0]) ? titles[0] : "";
-    if (!title) return null;
 
-    // 2) 抓頁面 HTML
-    const parsed = await huijiApi({ action: "parse", page: title, prop: "text" });
-    const html = parsed?.parse?.text || "";
-    const plain = stripHtml(html);
-
-    // 3) 抽出「前置」與「獲得/取得」
-    const prereq = pickPrereqFromText(plain);
-    const howto = isPrereqOrHowToQuery(userText) ? pickHowToFromText(plain) : "";
-
-    // 4) 如果問順位/順序：嘗試直接從頁面內的任務列表模板抓 #
-    const rank = isOrderOrRankQuery(userText) ? findRankInHtmlByTitle(html, title) : "";
-
-    // 5) 組合成「可直接餵給 AI」的可靠資料
-    const lines = [];
-    lines.push("【灰機 Wiki 擷取（以頁面內容為準）】");
-    lines.push(`查詢頁面：${title}`);
-    if (rank) lines.push(`清單順位：#${rank}（灰機任務列表順位，不等於遊戲內欄位）`);
-    if (prereq) lines.push(`前置/解鎖：${prereq}`);
-    if (howto) lines.push(`取得/來源摘要：${howto}`);
-    // 提供一點點背景，避免模型亂補
-    lines.push("規則：若已取得清單順位或前置資訊，回答時必須直接給結論；不可再向使用者追問『貼連結/截圖』。只有在本段沒有提供順位/前置且真的找不到時，才可以請使用者補充。" );
-
-    return lines.join("\n");
-  } catch {
-    return null;
-  }
-}
 
 function dayKeyTaipei() {
   // YYYY-MM-DD in Asia/Taipei
