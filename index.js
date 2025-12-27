@@ -357,21 +357,60 @@ function findRankInHtmlByTitle(html = "", title = "") {
   }
   return "";
 }
+
 async function huijiEnrichFF14(userText = "") {
   // 只在必要時才做網路查詢，避免浪費/變慢
   if (!isFF14Related(userText)) return null;
-  if (!isOrderOrRankQuery(userText) && !isPrereqOrHowToQuery(userText)) return null;
+  const wantRank = isOrderOrRankQuery(userText);
+  const wantInfo = isPrereqOrHowToQuery(userText);
+  if (!wantRank && !wantInfo) return null;
 
   const q = normalizeHuijiTitleGuess(userText);
   if (!q) return null;
 
+  const buildUrl = (t) =>
+    `https://ff14.huijiwiki.com/wiki/${encodeURIComponent(String(t || "").replace(/\s+/g, "_"))}`;
+
+  // 從任務頁面文字抓一些欄位（抓不到就留空，不影響）
+  const pickLevelFromText = (plain = "") => {
+    const m =
+      plain.match(/(?:任務等級|推薦等級|等級)\s*[:：]?\s*(\d{1,2})\b/) ||
+      plain.match(/\bLv\.?\s*(\d{1,2})\b/i);
+    return m && m[1] ? m[1] : "";
+  };
+
+  const pickVersionFromText = (plain = "") => {
+    const m = plain.match(/\b([0-9]+\.[0-9]+)\b/);
+    return m && m[1] ? m[1] : "";
+  };
+
+  const pickLocationFromText = (plain = "") => {
+    // 例：拉凱提卡大森林 (X:30.5, Y:17.4)
+    const m = plain.match(/([\u4e00-\u9fff]{2,20}).{0,30}?\(X\s*[:：]\s*([0-9.]+)\s*,\s*Y\s*[:：]\s*([0-9.]+)\)/);
+    if (m && m[1] && m[2] && m[3]) return `${m[1]}（X:${m[2]}, Y:${m[3]}）`;
+    return "";
+  };
+
+  // 排名找不到時：嘗試找「任務列表/主線列表」頁面再抓一次
+  const findRankViaListPages = async (title) => {
+    try {
+      const os2 = await huijiApi({ action: "opensearch", search: `${title} 主線 任務 列表`, limit: "5", namespace: "0" });
+      const titles2 = Array.isArray(os2?.[1]) ? os2[1] : [];
+      for (const t2 of titles2) {
+        const parsed2 = await huijiApi({ action: "parse", page: t2, prop: "text" });
+        const html2 = parsed2?.parse?.text || "";
+        const r2 = findRankInHtmlByTitle(html2, title);
+        if (r2) return r2;
+      }
+    } catch {}
+    return "";
+  };
+
   try {
     // 1) 先用 opensearch 找最接近的頁面
     const os = await huijiApi({ action: "opensearch", search: q, limit: "5", namespace: "0" });
-    const titles = Array.isArray(os?.[1])
-      ? os[1]
-      : (Array.isArray(os?.query?.search) ? os.query.search.map((x) => x.title) : []);
-    const title = titles && titles[0] ? titles[0] : "";
+    const titles = Array.isArray(os?.[1]) ? os[1] : (Array.isArray(os?.query?.search) ? os.query.search.map(x => x.title) : []);
+    const title = (titles && titles[0]) ? titles[0] : "";
     if (!title) return null;
 
     // 2) 抓頁面 HTML
@@ -379,120 +418,78 @@ async function huijiEnrichFF14(userText = "") {
     const html = parsed?.parse?.text || "";
     const plain = stripHtml(html);
 
-    // 3) 抽欄位：前置 / 取得 / 等級 / 版本 / 地點
+    // 3) 抽出「前置」與「獲得/取得」
     const prereq = pickPrereqFromText(plain);
-    const howto = isPrereqOrHowToQuery(userText) ? pickHowToFromText(plain) : "";
-    const level = pickQuestLevelFromText(plain);
-    const patch = pickPatchFromText(plain);
-    const location = pickLocationFromText(plain);
+    const howto = wantInfo ? pickHowToFromText(plain) : "";
 
-    // 4) 如果問順位/順序：嘗試直接從頁面內的任務列表模板抓 #
-    const rank = isOrderOrRankQuery(userText) ? findRankInHtmlByTitle(html, title) : "";
+    // 4) 問順位/順序：先從頁面內抓，抓不到就改從列表頁抓
+    let rank = wantRank ? findRankInHtmlByTitle(html, title) : "";
+    if (wantRank && !rank) {
+      rank = await findRankViaListPages(title);
+    }
+
+    const level = pickLevelFromText(plain);
+    const version = pickVersionFromText(plain);
+    const location = pickLocationFromText(plain);
+    const url = buildUrl(title);
+
+    const hintLines = [];
+    hintLines.push("【灰機 Wiki 擷取（以頁面內容為準）】");
+    hintLines.push(`查詢頁面：${title}`);
+    if (rank) hintLines.push(`清單順位：#${rank}（灰機任務列表順位，不等於遊戲內欄位）`);
+    if (prereq) hintLines.push(`前置/解鎖：${prereq}`);
+    if (howto) hintLines.push(`取得/來源摘要：${howto}`);
+    hintLines.push("規則：若已取得清單順位或前置資訊，回答時必須直接給結論；不可用『第X個環節/主要任務』這種模糊說法。只有在本段沒有提供順位/前置且真的找不到時，才可以請使用者補充。");
 
     return {
       title,
-      url: buildHuijiPageUrl(title),
-      rank: rank || "",
-      prereq: prereq || "",
-      howto: howto || "",
-      level: level || "",
-      patch: patch || "",
-      location: location || { place: "", coords: "" },
+      rank,
+      prereq,
+      howto,
+      level,
+      version,
+      location,
+      url,
+      hintText: hintLines.join("\n"),
     };
   } catch {
     return null;
   }
 }
-function formatFF14GoogleStyleAnswer(userText = "", data = {}) {
-  const title = data?.title || "";
-  const url = data?.url || "";
-  const rank = data?.rank ? String(data.rank) : "";
-  const prereq = data?.prereq || "";
-  const howto = data?.howto || "";
-  const level = data?.level || "";
-  const patch = data?.patch || "";
-  const locPlace = data?.location?.place || "";
-  const locCoords = data?.location?.coords || "";
 
-  const askedRank = isOrderOrRankQuery(userText);
-  const askedHow = isPrereqOrHowToQuery(userText);
+
+function formatFF14GoogleStyleAnswer(userText, huiji) {
+  const title = huiji?.title || "（未知任務）";
+  const rank = huiji?.rank || "";
+  const prereq = huiji?.prereq || "";
+  const howto = huiji?.howto || "";
+  const level = huiji?.level || "";
+  const version = huiji?.version || "";
+  const location = huiji?.location || "";
+  const url = huiji?.url || "";
 
   const lines = [];
-  lines.push("✨ **AI 摘要**");
-
-  if (askedRank && rank) {
-    const patchText = patch ? `（${patch}）` : "";
-    lines.push(`《FF14》任務「**${title}**」在主線任務清單中的順位為 **第 ${rank} 個**${patchText}（以灰機 Wiki 任務清單順序為準）。`);
-  } else if (askedHow && (prereq || howto)) {
-    lines.push(`《FF14》「**${title}**」的解鎖/前置與取得資訊如下（以灰機 Wiki 頁面內容為準）。`);
+  lines.push("✨ AI 摘要");
+  if (rank) {
+    const verText = version ? `${version} 版本` : "主線";
+    lines.push(`《最終幻想 XIV》「${title}」在 ${verText} 的主線任務清單中為第 **${rank}** 個（以灰機任務列表順序為準）。`);
   } else {
-    lines.push(`《FF14》「**${title}**」資訊整理如下（以灰機 Wiki 頁面內容為準）。`);
+    lines.push(`《最終幻想 XIV》「${title}」我已找到灰機頁面，但目前頁面/列表未能解析出「第幾個」順位（灰機清單格式可能變動）。`);
   }
-
   lines.push("");
 
-  // Google 風格：固定欄位條列（缺的就不硬塞）
-  const bullets = [];
-  if (title) bullets.push(`• **任務名稱**：${title}`);
-  if (level) bullets.push(`• **任務等級**：${level}`);
-  if (patch) bullets.push(`• **所屬版本**：${patch}`);
-
-  if (locPlace && locCoords) bullets.push(`• **接取地點**：${locPlace}（${locCoords}）`);
-  else if (locPlace) bullets.push(`• **接取地點**：${locPlace}`);
-  else if (locCoords) bullets.push(`• **接取地點**：${locCoords}`);
-
-  if (askedRank && rank) bullets.push(`• **清單順位**：第 ${rank} 個（灰機任務清單順位）`);
-  if (prereq) bullets.push(`• **前置/解鎖**：${prereq}`);
-  if (howto) bullets.push(`• **取得/來源摘要**：${howto}`);
-
-  if (bullets.length) lines.push(bullets.join("\n"));
-
-  if (url) {
-    lines.push("");
-    lines.push(`資料來源：${url}`);
-  }
+  // Google 風格：固定欄位條列
+  lines.push(`• **任務名稱**：${title}`);
+  if (level) lines.push(`• **任務等級**：${level}`);
+  if (version) lines.push(`• **所屬版本**：${version}`);
+  if (location) lines.push(`• **接取地點**：${location}`);
+  if (rank) lines.push(`• **清單順位**：#${rank}（以灰機 MSQ 清單為準）`);
+  if (prereq) lines.push(`• **前置/解鎖**：${prereq}`);
+  if (howto) lines.push(`• **取得/來源摘要**：${howto}`);
+  if (url) lines.push(`• **資料來源**：${url}`);
 
   return lines.join("\n");
 }
-
-
-function buildHuijiHintForModel(data = {}) {
-  const title = data?.title || "";
-  const url = data?.url || "";
-  const rank = data?.rank ? String(data.rank) : "";
-  const prereq = data?.prereq || "";
-  const howto = data?.howto || "";
-  const level = data?.level || "";
-  const patch = data?.patch || "";
-  const locPlace = data?.location?.place || "";
-  const locCoords = data?.location?.coords || "";
-
-  const lines = [];
-  lines.push("【灰機 Wiki 擷取（以頁面內容為準）】");
-  if (title) lines.push(`頁面：${title}`);
-  if (url) lines.push(`頁面連結：${url}`);
-  if (rank) lines.push(`清單順位：#${rank}（灰機任務列表順位，不等於遊戲內欄位）`);
-  if (level) lines.push(`任務等級：${level}`);
-  if (patch) lines.push(`所屬版本：${patch}`);
-  if (locPlace || locCoords) lines.push(`接取地點：${[locPlace, locCoords].filter(Boolean).join(" ")}`
-  );
-  if (prereq) lines.push(`前置/解鎖：${prereq}`);
-  if (howto) lines.push(`取得/來源摘要：${howto}`);
-
-  // ✅ 強制模板：避免模型講「第X個環節」這種模糊說法
-  lines.push("");
-  lines.push("【回答規則（必遵守）】");
-  lines.push("1) 若有『清單順位』，必須用：『第 N 個主線任務（以灰機任務清單順序為準）』。禁止使用『第N個環節/流程/節點』等模糊詞。");
-  lines.push("2) 回答請用 Google AI 摘要風格：先『AI 摘要』一段，再條列欄位（任務名稱/等級/版本/接取地點/前置/取得）。");
-  lines.push("3) 本段已提供資訊時，不可再追問使用者貼連結/截圖。只有完全沒抓到時才可詢問。");
-
-  return lines.join("\n");
-}
-
-
-
-
-
 
 
 function dayKeyTaipei() {
@@ -709,24 +706,27 @@ async function askGemini({ authorName, userText, userId }) {
 
   const history = convoMemory.get(userId) || [];
   // ✅ FF14：先用灰機自動對照「順位/前置/取得方式」
-  // - 若已抓到可靠的順位/前置/取得資訊：直接用「Google AI 摘要」格式回覆（不經 AI，避免亂補）
-  // - 否則：把可靠資料當成提示餵給模型（但仍要求固定格式）
-  let huijiData = null;
+  let huiji = null;
   try {
-    huijiData = await huijiEnrichFF14(userText);
+    huiji = await huijiEnrichFF14(userText);
   } catch {
-    huijiData = null;
+    huiji = null;
   }
 
-  if (huijiData && (huijiData.rank || huijiData.prereq || huijiData.howto)) {
-    return formatFF14GoogleStyleAnswer(userText, huijiData);
+  // ✅ 若問「第幾個/順位/前置/取得」且灰機有抓到可靠資料 → 直接用 Google 風格模板回覆（不讓 AI 腦補）
+  if (huiji && isFF14Related(userText)) {
+    const wantRank = isOrderOrRankQuery(userText);
+    const wantInfo = isPrereqOrHowToQuery(userText);
+    if ((wantRank && huiji.rank) || (wantInfo && (huiji.prereq || huiji.howto))) {
+      return formatFF14GoogleStyleAnswer(userText, huiji);
+    }
   }
-
-  const huijiHint = huijiData ? buildHuijiHintForModel(huijiData) : "";
 
   const prompt = [
     buildUserPrompt({ authorName, userText, history }),
-    huijiHint ? "\n\n" + huijiHint : "",
+    huiji?.hintText ? "
+
+" + huiji.hintText : "",
   ].join("");
 
   // 第一次嘗試（用已解析/預設模型）
