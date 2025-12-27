@@ -403,6 +403,18 @@ async function huijiEnrichFF14(userText = "") {
     return null;
   }
 }
+function formatFF14GoogleStyleAnswer(userText = "", data = {}) {
+  const title = data?.title || "";
+  const url = data?.url || "";
+  const rank = data?.rank ? String(data.rank) : "";
+  const prereq = data?.prereq || "";
+  const howto = data?.howto || "";
+  const level = data?.level || "";
+  const patch = data?.patch || "";
+  const locPlace = data?.location?.place || "";
+  const locCoords = data?.location?.coords || "";
+
+  const askedRank = isOrderOrRankQuery(userText);
   const askedHow = isPrereqOrHowToQuery(userText);
 
   const lines = [];
@@ -418,25 +430,31 @@ async function huijiEnrichFF14(userText = "") {
   }
 
   lines.push("");
+
   // Google 風格：固定欄位條列（缺的就不硬塞）
   const bullets = [];
-  bullets.push(`• **任務名稱**：${title || "（未取得）"}`);
+  if (title) bullets.push(`• **任務名稱**：${title}`);
   if (level) bullets.push(`• **任務等級**：${level}`);
   if (patch) bullets.push(`• **所屬版本**：${patch}`);
-    if (locPlace && locCoords) bullets.push(`• **接取地點**：${locPlace}（${locCoords}）`);
+
+  if (locPlace && locCoords) bullets.push(`• **接取地點**：${locPlace}（${locCoords}）`);
   else if (locPlace) bullets.push(`• **接取地點**：${locPlace}`);
   else if (locCoords) bullets.push(`• **接取地點**：${locCoords}`);
+
   if (askedRank && rank) bullets.push(`• **清單順位**：第 ${rank} 個（灰機任務清單順位）`);
   if (prereq) bullets.push(`• **前置/解鎖**：${prereq}`);
   if (howto) bullets.push(`• **取得/來源摘要**：${howto}`);
 
-  lines.push(bullets.join("\n"));
+  if (bullets.length) lines.push(bullets.join("\n"));
+
   if (url) {
     lines.push("");
     lines.push(`資料來源：${url}`);
   }
+
   return lines.join("\n");
 }
+
 
 function buildHuijiHintForModel(data = {}) {
   const title = data?.title || "";
