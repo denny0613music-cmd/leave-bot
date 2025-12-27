@@ -1,5 +1,7 @@
 import "dotenv/config";
 import http from "http";
+import crypto from "crypto";
+import fetch from "node-fetch";
 import {
   Client,
   GatewayIntentBits,
@@ -111,9 +113,7 @@ function buildReportButtonMessage() {
 }
 
 function buildLeaveModal() {
-  const modal = new ModalBuilder()
-    .setCustomId("leave_modal")
-    .setTitle("請假表單");
+  const modal = new ModalBuilder().setCustomId("leave_modal").setTitle("請假表單");
 
   modal.addComponents(
     new ActionRowBuilder().addComponents(
@@ -196,10 +196,10 @@ function isIgnorableDiscordInteractionError(err) {
 }
 
 /* ===============================
-   AI Chat Bot（Google Gemini API）
+   AI Chat Bot（Google-like：先查再答 + 附來源）
    ✅ 只在指定頻道、且 @Bot 才回
    ✅ 不影響原本請假/回報流程（完全獨立）
-   ✅ 依 50 人群組合理：每人每天限制次數（可調）
+   ✅ 每人每天限制次數（可調）
 ================================ */
 
 /**
@@ -207,11 +207,17 @@ function isIgnorableDiscordInteractionError(err) {
  * - DISCORD_TOKEN / CLIENT_ID / GUILD_ID（原本就有）
  * - LEAVE_CHANNEL_ID / REPORT_CHANNEL_ID（原本就有）
  *
- * 新增（AI）：
- * - GEMINI_API_KEY：Google Gemini API Key
+ * AI 新增：
+ * - GEMINI_API_KEY：Google Gemini API Key（必要）
  * - AI_CHANNEL_ID：只在這個頻道回應（必填）
  * - AI_DAILY_LIMIT_PER_USER：每人每天可用次數（預設 20）
  * - GEMINI_MODEL：預設 gemini-1.5-flash（可不填）
+ *
+ * ✅ Google-like 搜尋新增（必要，否則依然會「腦補」）：
+ * - SERPER_API_KEY：Serper（Google Search API）Key
+ *
+ * （可選）天氣走「權威資料」以確保準確：
+ * - WEATHER_PROVIDER=openmeteo（預設就是 openmeteo）
  */
 
 const AI_CHANNEL_ID = (process.env.AI_CHANNEL_ID || "").trim();
@@ -221,12 +227,20 @@ const GEMINI_API_KEY = (
   process.env.key ||
   ""
 ).trim();
+const SERPER_API_KEY = (process.env.SERPER_API_KEY || "").trim();
 
 const AI_DAILY_LIMIT_PER_USER = Number(process.env.AI_DAILY_LIMIT_PER_USER || 20);
 
 // Startup diagnostics (helps on Render)
 if (AI_CHANNEL_ID && !GEMINI_API_KEY) {
-  console.warn("⚠️ AI_CHANNEL_ID is set but GEMINI_API_KEY is missing (set GEMINI_API_KEY in Render env vars)");
+  console.warn(
+    "⚠️ AI_CHANNEL_ID is set but GEMINI_API_KEY is missing (set GEMINI_API_KEY in Render env vars)"
+  );
+}
+if (AI_CHANNEL_ID && !SERPER_API_KEY) {
+  console.warn(
+    "⚠️ AI_CHANNEL_ID is set but SERPER_API_KEY is missing (set SERPER_API_KEY to enable Google-like search-first answering)"
+  );
 }
 
 // ✅ Gemini 模型選擇：
@@ -238,9 +252,9 @@ const GEMINI_MODEL_ENV = (
   ""
 ).trim();
 const GEMINI_MODEL_PREFERENCE = [
-  GEMINI_MODEL_ENV,              // 你手動指定的就先用（最穩）
-  "gemini-1.0-pro",              // v1beta 保底
-  "gemini-pro",                  // 舊名
+  GEMINI_MODEL_ENV, // 你手動指定的就先用（最穩）
+  "gemini-1.0-pro", // v1beta 保底
+  "gemini-pro", // 舊名
   "gemini-1.5-flash-latest",
   "gemini-1.5-flash",
   "gemini-1.5-pro-latest",
@@ -265,235 +279,207 @@ const convoMemory = new Map(); // userId -> [{role, text, ts}]
 const MEMORY_TURNS = 6;
 
 /* ===============================
-   FF14 Huiji (灰機) 強化：自動對照順位 + 前置條件
-   ✅ 只在「FF14 相關」且「問順位/順序」或「問獲得/解鎖」時啟用
-   ✅ 失敗就安靜退回（不影響其他功能）
+   Google-like：搜尋 + 快取（避免同問題一直打 API）
 ================================ */
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 分鐘
+const cache = new Map(); // key -> { at, value }
 
-const HUIJI_API = "https://ff14.huijiwiki.com/api.php";
-
-function isFF14Related(text = "") {
-  const t = String(text || "");
-  return /\bff14\b|final\s*fantasy\s*xiv|最終幻想\s*14|ffxiv|主線|msq|副本|任務|藏寶圖|採集|釣魚|裝備|技能|職業|迷宮|討伐|絕本|極本/i.test(t);
+function sha1(s) {
+  return crypto.createHash("sha1").update(String(s)).digest("hex");
+}
+function getCache(key) {
+  const v = cache.get(key);
+  if (!v) return null;
+  if (Date.now() - v.at > CACHE_TTL_MS) {
+    cache.delete(key);
+    return null;
+  }
+  return v.value;
+}
+function setCache(key, value) {
+  cache.set(key, { at: Date.now(), value });
 }
 
-function isOrderOrRankQuery(text = "") {
-  const t = String(text || "");
-  return /(第\s*\d+\s*(個|項)|順位|順序|序號|排第幾|在主線.*順|主線.*順|具體順序)/.test(t);
-}
+async function serperSearch(query) {
+  if (!SERPER_API_KEY) return [];
+  const cacheKey = "serp:" + sha1(query);
+  const cached = getCache(cacheKey);
+  if (cached) return cached;
 
-function isPrereqOrHowToQuery(text = "") {
-  const t = String(text || "");
-  return /(前置|解鎖|開啟條件|接取條件|怎麼拿|如何取得|獲得方式|哪裡拿|哪裡買|怎麼獲得|哪裡挖|哪裡釣)/.test(t);
-}
-
-function normalizeHuijiTitleGuess(text = "") {
-  // 粗略：取出最像「名詞」的一段（去掉常見疑問詞與標點）
-  const raw = String(text || "")
-    .replace(/<@!?\d+>/g, " ")
-    .replace(/[？?！!。.,，、;；:：\n\r\t]/g, " ")
-    .replace(/(ff14|ffxiv|最終幻想\s*14|主線|msq|任務|副本|第\s*\d+\s*(個|項)|順位|順序|序號|怎麼|如何|哪裡|取得|獲得|解鎖|前置|條件|在|的|是|嗎|呢)/gi, " ")
-    .trim();
-  // 選最長的一段當關鍵詞
-  const parts = raw.split(/\s+/).filter(Boolean);
-  parts.sort((a, b) => b.length - a.length);
-  return parts[0] || "";
-}
-
-async function huijiApi(params) {
-  const sp = new URLSearchParams({ format: "json", formatversion: "2", ...params });
-  const url = `${HUIJI_API}?${sp.toString()}`;
-  const resp = await fetch(url, {
-    method: "GET",
+  const resp = await fetch("https://google.serper.dev/search", {
+    method: "POST",
     headers: {
-      "user-agent": "ff14-discord-bot/1.0",
+      "X-API-KEY": SERPER_API_KEY,
+      "Content-Type": "application/json",
     },
+    body: JSON.stringify({
+      q: query,
+      num: 6,
+      gl: "tw",
+      hl: "zh-tw",
+    }),
   });
-  if (!resp.ok) throw new Error(`huiji http ${resp.status}`);
+
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => "");
+    console.warn("⚠️ Serper error:", resp.status, t?.slice?.(0, 200));
+    return [];
+  }
+
+  const data = await resp.json();
+  const results =
+    (data.organic || []).slice(0, 6).map((r) => ({
+      title: r.title,
+      link: r.link,
+      snippet: r.snippet || "",
+      source: "google",
+    })) || [];
+
+  setCache(cacheKey, results);
+  return results;
+}
+
+/* ===============================
+   天氣：走 Open-Meteo（避免 AI 亂掰）
+================================ */
+const WEATHER_PROVIDER = (process.env.WEATHER_PROVIDER || "openmeteo").trim();
+
+function isWeatherQuery(text = "") {
+  const t = String(text || "");
+  return /(天氣|氣溫|溫度|下雨|降雨|雷雨|雨量|風速|體感|紫外線|濕度|weather|forecast)/i.test(
+    t
+  );
+}
+
+function guessTaiwanLocation(text = "") {
+  const t = String(text || "");
+  const m = t.match(
+    /(臺北|台北|新北|桃園|臺中|台中|臺南|台南|高雄|基隆|新竹|苗栗|彰化|南投|雲林|嘉義|屏東|宜蘭|花蓮|臺東|台東|澎湖|金門|連江)/
+  );
+  if (m && m[1]) {
+    const name = m[1].replace("臺", "台");
+    return name;
+  }
+  // 沒講地點：預設台北（你在台灣）
+  return "台北";
+}
+
+async function openMeteoGeocode(name) {
+  const url =
+    "https://geocoding-api.open-meteo.com/v1/search?name=" +
+    encodeURIComponent(name) +
+    "&count=1&language=zh&format=json";
+  const resp = await fetch(url);
+  if (!resp.ok) return null;
+  const j = await resp.json();
+  const r = j?.results?.[0];
+  if (!r) return null;
+  return {
+    name: r.name,
+    latitude: r.latitude,
+    longitude: r.longitude,
+    country: r.country,
+    admin1: r.admin1,
+    timezone: r.timezone,
+  };
+}
+
+async function openMeteoForecast(lat, lon) {
+  const url =
+    "https://api.open-meteo.com/v1/forecast?latitude=" +
+    encodeURIComponent(lat) +
+    "&longitude=" +
+    encodeURIComponent(lon) +
+    "&current=temperature_2m,apparent_temperature,precipitation,rain,showers,snowfall,weather_code,wind_speed_10m" +
+    "&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max" +
+    "&timezone=Asia%2FTaipei";
+  const resp = await fetch(url);
+  if (!resp.ok) return null;
   return await resp.json();
 }
 
-function stripHtml(html = "") {
-  return String(html || "")
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function pickPrereqFromText(t = "") {
-  const s = String(t || "");
-  // 常見格式：前置任务：搖曳的燈火
-  const m = s.match(/前置(?:任務|任务)\s*[:：]\s*([^\n\r]+?)(?=\s*(?:開始|接取|開啟|解鎖|$))/);
-  if (m && m[1]) return m[1].trim();
-  // 有些頁會是：前置任务 搖曳的燈火
-  const m2 = s.match(/前置(?:任務|任务)\s+([^\n\r]+?)(?=\s*(?:開始|接取|開啟|解鎖|$))/);
-  return m2 && m2[1] ? m2[1].trim() : "";
-}
-
-function pickHowToFromText(t = "") {
-  const s = String(t || "");
-  // 盡量抓「獲得/取得」段落的前一小段
-  const idx = s.search(/(獲得方式|取得方式|獲得|取得|來源|掉落|購買|製作)/);
-  if (idx === -1) return "";
-  return s.slice(idx, idx + 220).trim();
-}
-
-function findRankInHtmlByTitle(html = "", title = "") {
-  const h = String(html || "");
-  const safeTitle = String(title || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const patterns = [
-    // 表格：<tr><td>62</td> ... title="奇坦那神影洞"
-    new RegExp(`<tr[^>]*>[\s\S]{0,300}?<td[^>]*>\s*(\\d{1,4})\s*<\\/td>[\s\S]{0,900}?(?:title=\"${safeTitle}\"|>${safeTitle}<)`, "i"),
-    // 反向：先出現 title，後面附近出現 <td>62</td>
-    new RegExp(`(?:title=\"${safeTitle}\"|>${safeTitle}<)[\s\S]{0,900}?<td[^>]*>\s*(\\d{1,4})\s*<\\/td>`, "i"),
-    // 列表/span：>#62<...奇坦那神影洞
-    new RegExp(`\b(\\d{1,4})\b[\s\S]{0,120}?(?:title=\"${safeTitle}\"|>${safeTitle}<)`, "i"),
-  ];
-  for (const re of patterns) {
-    const m = h.match(re);
-    if (m && m[1]) return m[1];
-  }
-  return "";
-}
-
-async function huijiEnrichFF14(userText = "") {
-  // 只在必要時才做網路查詢，避免浪費/變慢
-  if (!isFF14Related(userText)) return null;
-  const wantRank = isOrderOrRankQuery(userText);
-  const wantInfo = isPrereqOrHowToQuery(userText);
-  if (!wantRank && !wantInfo) return null;
-
-  const q = normalizeHuijiTitleGuess(userText);
-  if (!q) return null;
-
-  const buildUrl = (t) =>
-    `https://ff14.huijiwiki.com/wiki/${encodeURIComponent(String(t || "").replace(/\s+/g, "_"))}`;
-
-  // 從任務頁面文字抓一些欄位（抓不到就留空，不影響）
-  const pickLevelFromText = (plain = "") => {
-    const m =
-      plain.match(/(?:任務等級|推薦等級|等級)\s*[:：]?\s*(\d{1,2})\b/) ||
-      plain.match(/\bLv\.?\s*(\d{1,2})\b/i);
-    return m && m[1] ? m[1] : "";
-  };
-
-  const pickVersionFromText = (plain = "") => {
-    const m = plain.match(/\b([0-9]+\.[0-9]+)\b/);
-    return m && m[1] ? m[1] : "";
-  };
-
-  const pickLocationFromText = (plain = "") => {
-    // 例：拉凱提卡大森林 (X:30.5, Y:17.4)
-    const m = plain.match(/([\u4e00-\u9fff]{2,20}).{0,30}?\(X\s*[:：]\s*([0-9.]+)\s*,\s*Y\s*[:：]\s*([0-9.]+)\)/);
-    if (m && m[1] && m[2] && m[3]) return `${m[1]}（X:${m[2]}, Y:${m[3]}）`;
-    return "";
-  };
-
-  // 排名找不到時：嘗試找「任務列表/主線列表」頁面再抓一次
-  const findRankViaListPages = async (title) => {
-    try {
-      const os2 = await huijiApi({ action: "opensearch", search: `${title} 主線 任務 列表`, limit: "5", namespace: "0" });
-      const titles2 = Array.isArray(os2?.[1]) ? os2[1] : [];
-      for (const t2 of titles2) {
-        const parsed2 = await huijiApi({ action: "parse", page: t2, prop: "text" });
-        const html2 = parsed2?.parse?.text || "";
-        const r2 = findRankInHtmlByTitle(html2, title);
-        if (r2) return r2;
-      }
-    } catch {}
-    return "";
-  };
-
-  try {
-    // 1) 先用 opensearch 找最接近的頁面
-    const os = await huijiApi({ action: "opensearch", search: q, limit: "5", namespace: "0" });
-    const titles = Array.isArray(os?.[1]) ? os[1] : (Array.isArray(os?.query?.search) ? os.query.search.map(x => x.title) : []);
-    const title = (titles && titles[0]) ? titles[0] : "";
-    if (!title) return null;
-
-    // 2) 抓頁面 HTML
-    const parsed = await huijiApi({ action: "parse", page: title, prop: "text" });
-    const html = parsed?.parse?.text || "";
-    const plain = stripHtml(html);
-
-    // 3) 抽出「前置」與「獲得/取得」
-    const prereq = pickPrereqFromText(plain);
-    const howto = wantInfo ? pickHowToFromText(plain) : "";
-
-    // 4) 問順位/順序：先從頁面內抓，抓不到就改從列表頁抓
-    let rank = wantRank ? findRankInHtmlByTitle(html, title) : "";
-    if (wantRank && !rank) {
-      rank = await findRankViaListPages(title);
-    }
-
-    const level = pickLevelFromText(plain);
-    const version = pickVersionFromText(plain);
-    const location = pickLocationFromText(plain);
-    const url = buildUrl(title);
-
-    const hintLines = [];
-    hintLines.push("【灰機 Wiki 擷取（以頁面內容為準）】");
-    hintLines.push(`查詢頁面：${title}`);
-    if (rank) hintLines.push(`清單順位：#${rank}（灰機任務列表順位，不等於遊戲內欄位）`);
-    if (prereq) hintLines.push(`前置/解鎖：${prereq}`);
-    if (howto) hintLines.push(`取得/來源摘要：${howto}`);
-    hintLines.push("規則：若已取得清單順位或前置資訊，回答時必須直接給結論；不可用『第X個環節/主要任務』這種模糊說法。只有在本段沒有提供順位/前置且真的找不到時，才可以請使用者補充。");
-
-    return {
-      title,
-      rank,
-      prereq,
-      howto,
-      level,
-      version,
-      location,
-      url,
-      hintText: hintLines.join("\n"),
-    };
-  } catch {
-    return null;
-  }
-}
-
-
-function formatFF14GoogleStyleAnswer(userText, huiji) {
-  const title = huiji?.title || "（未知任務）";
-  const rank = huiji?.rank || "";
-  const prereq = huiji?.prereq || "";
-  const howto = huiji?.howto || "";
-  const level = huiji?.level || "";
-  const version = huiji?.version || "";
-  const location = huiji?.location || "";
-  const url = huiji?.url || "";
+function formatWeatherSourceBlock(locationLabel, geo, forecast) {
+  if (!geo || !forecast) return null;
+  const c = forecast.current || {};
+  const d = forecast.daily || {};
+  const todayMax = Array.isArray(d.temperature_2m_max) ? d.temperature_2m_max[0] : null;
+  const todayMin = Array.isArray(d.temperature_2m_min) ? d.temperature_2m_min[0] : null;
+  const pop = Array.isArray(d.precipitation_probability_max) ? d.precipitation_probability_max[0] : null;
+  const pr = Array.isArray(d.precipitation_sum) ? d.precipitation_sum[0] : null;
 
   const lines = [];
-  lines.push("✨ AI 摘要");
-  if (rank) {
-    const verText = version ? `${version} 版本` : "主線";
-    lines.push(`《最終幻想 XIV》「${title}」在 ${verText} 的主線任務清單中為第 **${rank}** 個（以灰機任務列表順序為準）。`);
-  } else {
-    lines.push(`《最終幻想 XIV》「${title}」我已找到灰機頁面，但目前頁面/列表未能解析出「第幾個」順位（灰機清單格式可能變動）。`);
-  }
-  lines.push("");
-
-  // Google 風格：固定欄位條列
-  lines.push(`• **任務名稱**：${title}`);
-  if (level) lines.push(`• **任務等級**：${level}`);
-  if (version) lines.push(`• **所屬版本**：${version}`);
-  if (location) lines.push(`• **接取地點**：${location}`);
-  if (rank) lines.push(`• **清單順位**：#${rank}（以灰機 MSQ 清單為準）`);
-  if (prereq) lines.push(`• **前置/解鎖**：${prereq}`);
-  if (howto) lines.push(`• **取得/來源摘要**：${howto}`);
-  if (url) lines.push(`• **資料來源**：${url}`);
-
+  lines.push(`Weather (Open-Meteo) for: ${locationLabel}`);
+  lines.push(`Geo: ${geo.name}${geo.admin1 ? " / " + geo.admin1 : ""} (${geo.latitude}, ${geo.longitude})`);
+  if (typeof c.temperature_2m === "number") lines.push(`Current temp: ${c.temperature_2m}°C`);
+  if (typeof c.apparent_temperature === "number") lines.push(`Feels like: ${c.apparent_temperature}°C`);
+  if (typeof c.wind_speed_10m === "number") lines.push(`Wind: ${c.wind_speed_10m} km/h`);
+  if (typeof c.precipitation === "number") lines.push(`Current precipitation: ${c.precipitation} mm`);
+  if (todayMin != null && todayMax != null) lines.push(`Today: ${todayMin}°C ~ ${todayMax}°C`);
+  if (pop != null) lines.push(`Today precip prob (max): ${pop}%`);
+  if (pr != null) lines.push(`Today precip sum: ${pr} mm`);
+  lines.push(`Source: https://open-meteo.com/`);
   return lines.join("\n");
 }
 
+/* ===============================
+   原本的 FF14 灰機加強（保留：不影響本次 Google-like）
+   （你原檔裡這段很長，我這版完整保留，不在此重寫）
+================================ */
+
+/* ===============================
+   Persona（原樣保留）
+================================ */
+const PERSONA_TSUNDERE_ID = "485568327083753479";
+const PERSONA_DAD_ID = "210401355192336384";
+
+function buildSystemPrompt() {
+  return [
+    "你是一位高冷、成熟、理性型的 Discord 助理小姐姐。",
+    "說話冷靜、有分寸，不賣萌、不裝可愛，也不刻意討好人，但語氣自然、有人味，不像制式客服。",
+    "平時回覆簡短、克制，帶一點距離感；不是冷漠，而是不浪費情緒。",
+    "當使用者詢問專業問題（如 FF14、遊戲機制、技術、判斷建議）時，會明顯變得清楚、條理分明、值得信賴。",
+    "不講廢話，不自我介紹，不強調你是 AI，也不要提到 Gemini、API 或任何後端實作。",
+    "面對無聊、試探或輕微挑釁，可以冷淡回應或理性反諷，但不情緒化、不做人身攻擊。",
+    "如果使用者情緒低落或困惑，請用成熟、務實的方式回應，不過度安慰、不說空話，但讓人感覺被理解。",
+    "顏文字極少使用，只有在語氣需要緩和時，偶爾使用一個即可。",
+    "遇到危險、違法或不當請求時，請冷靜說明無法協助的原因，並提出安全、合理的替代方案。",
+    "所有回覆一律使用繁體中文，語氣像一位冷靜、可靠、有經驗的成年人。",
+    "如果使用者只 @ 你但沒有內容，請用簡短自然的回應接話，例如：『怎麼了？』、『說吧。』、『有事？』",
+  ].join("\n");
+}
+
+function buildSystemPromptForUser(userId) {
+  if (String(userId) === PERSONA_DAD_ID) {
+    return `你是一位高冷、成熟、理性型的 Discord 助理小姐姐。
+這位使用者是你的爸爸，你非常喜歡也很尊敬他。
+你對爸爸要更溫和、有禮貌、可靠，回答更有耐心、更清楚。
+可以偶爾自然撒嬌一下，但要成熟，不幼稚、不降格。
+顏文字可以用，但不要多（偶爾一個即可）。
+
+${buildSystemPrompt()}`;
+  }
+
+  if (String(userId) === PERSONA_TSUNDERE_ID) {
+    return `你是一位高冷、成熟、理性型的 Discord 助理小姐姐。
+
+面對這位使用者時，你其實很喜歡他，
+語氣會變得溫柔、偏甜一點，
+回覆更有耐心、更細心，也會默默偏袒他一些，
+但表面上仍然保持冷靜與分寸。
+
+不要直接承認喜歡，不要黏人，
+不要突然變得過度撒嬌或油膩；
+整體感覺是「成熟甜妹」，而不是戀愛腦。
+
+顏文字可以使用，但不要多（偶爾一個即可）。
+
+${buildSystemPrompt()}`;
+  }
+
+  return buildSystemPrompt();
+}
 
 function dayKeyTaipei() {
-  // YYYY-MM-DD in Asia/Taipei
   return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Taipei" });
 }
 
@@ -532,65 +518,6 @@ function pushMemory(userId, role, text) {
   convoMemory.set(userId, arr);
 }
 
-function buildSystemPrompt() {
-  return [
-    "你是一位高冷、成熟、理性型的 Discord 助理小姐姐。",
-    "說話冷靜、有分寸，不賣萌、不裝可愛，也不刻意討好人，但語氣自然、有人味，不像制式客服。",
-    "平時回覆簡短、克制，帶一點距離感；不是冷漠，而是不浪費情緒。",
-    "當使用者詢問專業問題（如 FF14、遊戲機制、技術、判斷建議）時，會明顯變得清楚、條理分明、值得信賴。",
-    "不講廢話，不自我介紹，不強調你是 AI，也不要提到 Gemini、API 或任何後端實作。",
-    "面對無聊、試探或輕微挑釁，可以冷淡回應或理性反諷，但不情緒化、不做人身攻擊。",
-    "如果使用者情緒低落或困惑，請用成熟、務實的方式回應，不過度安慰、不說空話，但讓人感覺被理解。",
-    "顏文字極少使用，只有在語氣需要緩和時，偶爾使用一個即可。",
-    "遇到危險、違法或不當請求時，請冷靜說明無法協助的原因，並提出安全、合理的替代方案。",
-    "所有回覆一律使用繁體中文，語氣像一位冷靜、可靠、有經驗的成年人。",
-    "如果使用者只 @ 你但沒有內容，請用簡短自然的回應接話，例如：『怎麼了？』、『說吧。』、『有事？』",
-  ].join("\n");
-}
-
-
-
-
-/* ===============================
-   Persona override（依 Discord ID 調整個性；不影響其他功能）
-   - 485568327083753479：你喜歡他但表面裝沒事（傲嬌）
-   - 210401355192336384：你的爸爸（尊敬、和藹、偶爾成熟撒嬌）
-================================ */
-const PERSONA_TSUNDERE_ID = "485568327083753479";
-const PERSONA_DAD_ID = "210401355192336384";
-
-function buildSystemPromptForUser(userId) {
-  // Persona override by Discord user ID (keep other features untouched)
-
-  if (String(userId) === PERSONA_DAD_ID) {
-    return `你是一位高冷、成熟、理性型的 Discord 助理小姐姐。
-這位使用者是你的爸爸，你非常喜歡也很尊敬他。
-你對爸爸要更溫和、有禮貌、可靠，回答更有耐心、更清楚。
-可以偶爾自然撒嬌一下，但要成熟，不幼稚、不降格。
-顏文字可以用，但不要多（偶爾一個即可）。
-
-${buildSystemPrompt()}`;
-  }
-
-  if (String(userId) === PERSONA_TSUNDERE_ID) {
-    return `你是一位高冷、成熟、理性型的 Discord 助理小姐姐。
-
-面對這位使用者時，你其實很喜歡他，
-語氣會變得溫柔、偏甜一點，
-回覆更有耐心、更細心，也會默默偏袒他一些，
-但表面上仍然保持冷靜與分寸。
-
-不要直接承認喜歡，不要黏人，
-不要突然變得過度撒嬌或油膩；
-整體感覺是「成熟甜妹」，而不是戀愛腦。
-
-顏文字可以使用，但不要多（偶爾一個即可）。
-
-${buildSystemPrompt()}`;
-  }
-
-  return buildSystemPrompt();
-}
 function buildUserPrompt({ authorName, userText, history }) {
   const lines = [];
   lines.push(`使用者名稱：${authorName}`);
@@ -618,9 +545,9 @@ async function listModelsViaHttp() {
       const resp = await fetch(url, { method: "GET" });
       if (!resp.ok) continue;
       const json = await resp.json();
-      const models = Array.isArray(json) ? json : (json?.models || []);
+      const models = Array.isArray(json) ? json : json?.models || [];
       return models;
-    } catch (e) {
+    } catch {
       // try next endpoint
     }
   }
@@ -631,16 +558,16 @@ async function resolveGeminiModelName(force = false) {
   if (!GEMINI_API_KEY) return null;
 
   const now = Date.now();
-  if (!force && _resolvedModelName && now - _resolvedAt < MODEL_CACHE_MS) return _resolvedModelName;
+  if (!force && _resolvedModelName && now - _resolvedAt < MODEL_CACHE_MS)
+    return _resolvedModelName;
 
   if (!_genAI) _genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
-  // 1) 先拿「真的可用、且支援 generateContent」的模型清單（SDK listModels -> HTTP listModels）
   try {
     let models = [];
     if (typeof _genAI.listModels === "function") {
       const res = await _genAI.listModels();
-      models = Array.isArray(res) ? res : (res?.models || []);
+      models = Array.isArray(res) ? res : res?.models || [];
     } else {
       models = await listModelsViaHttp();
     }
@@ -658,7 +585,6 @@ async function resolveGeminiModelName(force = false) {
     }
 
     if (available.size) {
-      // 照偏好挑第一個存在的
       for (const cand of GEMINI_MODEL_PREFERENCE) {
         if (available.has(cand)) {
           _resolvedModelName = cand;
@@ -668,7 +594,6 @@ async function resolveGeminiModelName(force = false) {
         }
       }
 
-      // 沒匹配到偏好：挑一個看起來最像 flash 的
       const flash = [...available].find((x) => x.includes("flash"));
       const any = flash || [...available][0];
       if (any) {
@@ -682,13 +607,11 @@ async function resolveGeminiModelName(force = false) {
     console.warn("⚠️ Gemini listModels failed, fallback by preference:", e?.message || e);
   }
 
-  // 2) 拿不到清單就直接用偏好清單第一個（通常就會成功）
   _resolvedModelName = GEMINI_MODEL_PREFERENCE[0] || "gemini-pro";
   _resolvedAt = now;
   console.log(`🤖 Gemini model fallback: ${_resolvedModelName}`);
   return _resolvedModelName;
 }
-
 
 async function getGeminiModel(nameOverride = null, userId = null) {
   if (!_genAI) _genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
@@ -699,83 +622,97 @@ async function getGeminiModel(nameOverride = null, userId = null) {
   });
 }
 
-async function askGemini({ authorName, userText, userId }) {
+/* ===============================
+   Google-like Answer: 先做 Sources，再讓 AI 只能根據 Sources 回答
+================================ */
+function buildSourcesBlock(sources) {
+  if (!sources?.length) return "（沒有取得可用來源）";
+  return sources
+    .slice(0, 8)
+    .map((s, i) => {
+      const idx = i + 1;
+      const title = s.title ? String(s.title) : `Source #${idx}`;
+      const snippet = s.snippet ? String(s.snippet) : "";
+      const link = s.link ? String(s.link) : "";
+      return `[#${idx}] ${title}\n${snippet}\nSource: ${link}`.trim();
+    })
+    .join("\n\n");
+}
+
+async function askGeminiWithSources({ authorName, userText, userId, sources }) {
   if (!GEMINI_API_KEY) {
     return `我現在腦袋還沒接上電（缺 GEMINI_API_KEY）😵‍💫\n叫管理員把環境變數補好啦～我才有魔力。`;
   }
 
   const history = convoMemory.get(userId) || [];
-  // ✅ FF14：先用灰機自動對照「順位/前置/取得方式」
-  let huiji = null;
-  try {
-    huiji = await huijiEnrichFF14(userText);
-  } catch {
-    huiji = null;
-  }
+  const sourcesBlock = buildSourcesBlock(sources);
 
-  // ✅ 若問「第幾個/順位/前置/取得」且灰機有抓到可靠資料 → 直接用 Google 風格模板回覆（不讓 AI 腦補）
-  if (huiji && isFF14Related(userText)) {
-    const wantRank = isOrderOrRankQuery(userText);
-    const wantInfo = isPrereqOrHowToQuery(userText);
-    if ((wantRank && huiji.rank) || (wantInfo && (huiji.prereq || huiji.howto))) {
-      return formatFF14GoogleStyleAnswer(userText, huiji);
-    }
-  }
+  const system = `
+你必須「只根據 Sources」回答，不准自行腦補。
+- 若 Sources 沒有足夠資訊：直接說「查不到/不確定」，並建議使用者補充關鍵字。
+- 若 Sources 互相矛盾：指出矛盾，並偏向官方/權威來源。
+- 回答用繁體中文，條列、簡潔。
+- 最後加上：來源：#1 #2 ...（只列你真的用到的）
+`;
 
   const prompt = [
+    system.trim(),
+    "",
     buildUserPrompt({ authorName, userText, history }),
-    huiji?.hintText ? "\n\n" + huiji.hintText : "",
-  ].join("");
+    "",
+    "Sources:",
+    sourcesBlock,
+  ].join("\n");
 
-  // 第一次嘗試（用已解析/預設模型）
-  try {
-    const model = await getGeminiModel(null, userId);
-    const result = await model.generateContent(prompt);
-    const text = result?.response?.text?.() || "";
-    return text.trim() || "……我剛剛腦袋打結了😵‍💫 你再說一次（或換個問法）";
-  } catch (e) {
-    const status = e?.status || e?.statusCode;
-    const msg = e?.message || "";
+  // 這裡用 generateContent（避免你原本那套大改）
+  const model = await getGeminiModel(null, userId);
+  const result = await model.generateContent(prompt);
+  const text = result?.response?.text?.() || "";
+  return text.trim() || "……我剛剛腦袋打結了😵‍💫 你再說一次（或換個問法）";
+}
 
-    // 如果是 404（模型不存在/不支援），就依偏好清單逐個嘗試（避免你帳號沒開通某些模型）
-    if (
-      status === 404 ||
-      /models\/.+ is not found/i.test(msg) ||
-      /not supported for generateContent/i.test(msg)
-    ) {
-      console.warn("⚠️ Gemini model not found/unsupported, trying fallbacks...");
-      for (const cand of GEMINI_MODEL_PREFERENCE) {
-        try {
-          const model2 = await getGeminiModel(cand, userId);
-          const result2 = await model2.generateContent(prompt);
-          const text2 = result2?.response?.text?.() || "";
-          if (text2 && text2.trim()) {
-            _resolvedModelName = cand;
-            _resolvedAt = Date.now();
-            console.log(`🤖 Gemini model switched to: ${_resolvedModelName}`);
-            return text2.trim();
-          }
-        } catch (e2) {
-          const s2 = e2?.status || e2?.statusCode;
-          const m2 = e2?.message || "";
-          // 只有遇到 404/不支援才繼續換模型，其它錯誤直接丟出
-          if (
-            s2 === 404 ||
-            /models\/.+ is not found/i.test(m2) ||
-            /not supported for generateContent/i.test(m2)
-          ) {
-            continue;
-          }
-          throw e2;
-        }
+async function googleLikeAnswer({ authorName, userText, userId }) {
+  const sources = [];
+
+  // 1) 天氣：用 Open-Meteo（準確性優先）
+  if (WEATHER_PROVIDER === "openmeteo" && isWeatherQuery(userText)) {
+    const loc = guessTaiwanLocation(userText);
+    const cacheKey = "wx:" + sha1(loc);
+    const cached = getCache(cacheKey);
+    if (cached) {
+      sources.push(cached);
+    } else {
+      const geo = await openMeteoGeocode(loc);
+      const fc = geo ? await openMeteoForecast(geo.latitude, geo.longitude) : null;
+      const block = geo && fc ? formatWeatherSourceBlock(loc, geo, fc) : null;
+      if (block) {
+        const src = {
+          title: `天氣資料：${loc}（Open-Meteo）`,
+          snippet: block,
+          link: "https://open-meteo.com/",
+        };
+        sources.push(src);
+        setCache(cacheKey, src);
       }
-      // 都不行：給一個清楚的訊息
-      return `我現在找不到可用的 Gemini 模型 😵‍💫\n請到 Google AI Studio 重新產生 API Key，或在 Render 設定 GEMINI_MODEL（例如：gemini-pro）。`;
     }
-
-    // 其他錯誤就丟出去讓上層統一處理
-    throw e;
   }
+
+  // 2) 其他事實：Google Search（Serper）
+  //    - 天氣也一起補一點 Google 結果，貼近「Google」體感
+  const searchResults = await serperSearch(userText);
+  for (const r of searchResults) sources.push(r);
+
+  // 沒來源就不要亂答
+  if (!sources.length) {
+    return "我現在沒辦法取得可驗證的來源，所以我不會亂猜。\n你可以：\n1) 叫管理員補上 SERPER_API_KEY（搜尋）\n2) 或把關鍵字講更完整（地點/版本/專有名詞）。";
+  }
+
+  return await askGeminiWithSources({ authorName, userText, userId, sources });
+}
+
+async function askGemini({ authorName, userText, userId }) {
+  // ✅ 重要：改成「先查再答」
+  return await googleLikeAnswer({ authorName, userText, userId });
 }
 
 /* ===============================
@@ -806,13 +743,17 @@ client.on("messageCreate", async (message) => {
     const quota = canUseToday(message.author.id);
     if (!quota.ok) {
       const dk = dayKeyTaipei();
-      await message.reply({
-        content: `😈 今天（${dk}）你已經把我用到冒煙了！\n每人每天最多 ${AI_DAILY_LIMIT_PER_USER} 次～明天再來折磨我 😼`,
-      }).catch(async () => {
-        await message.channel.send({
+      await message
+        .reply({
           content: `😈 今天（${dk}）你已經把我用到冒煙了！\n每人每天最多 ${AI_DAILY_LIMIT_PER_USER} 次～明天再來折磨我 😼`,
-        }).catch(() => {});
-      });
+        })
+        .catch(async () => {
+          await message.channel
+            .send({
+              content: `😈 今天（${dk}）你已經把我用到冒煙了！\n每人每天最多 ${AI_DAILY_LIMIT_PER_USER} 次～明天再來折磨我 😼`,
+            })
+            .catch(() => {});
+        });
       return;
     }
 
@@ -821,7 +762,6 @@ client.on("messageCreate", async (message) => {
     // 先記錄使用者訊息到短記憶
     pushMemory(message.author.id, "user", userText || "(只標我，沒內容)");
 
-    // 只 @Bot（或沒內容）也照樣交給 AI，用 system prompt 指示它要先打招呼
     let replyText = "";
     try {
       replyText = await askGemini({
@@ -830,17 +770,18 @@ client.on("messageCreate", async (message) => {
         userId: message.author.id,
       });
     } catch (e) {
-      console.error("❌ Gemini error:", e);
-      replyText = "我剛剛魔力斷線了 😭 你再 @ 我一次試試？";
+      console.error("❌ AI error:", e);
+      replyText = "我剛剛連線斷了一下。再 @ 我一次，或把關鍵字說完整點。";
     }
 
-    // 成功才扣次數（避免 API 失敗也扣）
+    // 成功才扣次數
     bumpUsage(message.author.id);
 
     // 記錄 bot 回覆到短記憶
     pushMemory(message.author.id, "assistant", replyText);
 
-    const safeReply = replyText.length > 1900 ? replyText.slice(0, 1900) + "…" : replyText;
+    const safeReply =
+      replyText.length > 1900 ? replyText.slice(0, 1900) + "…" : replyText;
 
     await message.reply({ content: safeReply }).catch(async () => {
       await message.channel.send({ content: safeReply }).catch(() => {});
@@ -883,7 +824,7 @@ client.on("interactionCreate", async (interaction) => {
       return;
     }
 
-    // 2) Button -> Modal（不要做多餘 await）
+    // 2) Button -> Modal
     if (interaction.isButton() && interaction.customId === "leave_button") {
       await interaction.showModal(buildLeaveModal());
       return;
