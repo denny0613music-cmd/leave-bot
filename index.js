@@ -214,11 +214,30 @@ function isIgnorableDiscordInteractionError(err) {
  * - GEMINI_MODEL：預設 gemini-1.5-flash（可不填）
  */
 
-const AI_CHANNEL_ID = process.env.AI_CHANNEL_ID;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const AI_CHANNEL_ID = (process.env.AI_CHANNEL_ID || "").trim();
+const GEMINI_API_KEY = (process.env.GEMINI_API_KEY || "").trim();
 
 const AI_DAILY_LIMIT_PER_USER = Number(process.env.AI_DAILY_LIMIT_PER_USER || 20);
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+
+// ✅ Gemini 模型選擇：
+// - 優先使用環境變數 GEMINI_MODEL
+// - 若該模型不可用，會自動 fallback 到可用模型（避免 404）
+const GEMINI_MODEL_ENV = (process.env.GEMINI_MODEL || "").trim();
+const GEMINI_MODEL_PREFERENCE = [
+  GEMINI_MODEL_ENV,
+  "gemini-1.5-flash-latest",
+  "gemini-1.5-flash",
+  "gemini-1.5-pro-latest",
+  "gemini-1.5-pro",
+  "gemini-1.0-pro",
+  "gemini-pro",
+].filter(Boolean);
+
+// Gemini client/model cache（避免每次呼叫都 new）
+let _genAI = null;
+let _resolvedModelName = null;
+let _resolvedAt = 0;
+const MODEL_CACHE_MS = 60 * 60 * 1000; // 1 小時
 
 // 節流：避免同一人狂 ping（秒級）
 const lastUserAskAt = new Map(); // userId -> ts
@@ -296,23 +315,131 @@ function buildUserPrompt({ authorName, userText, history }) {
   return lines.join("\n");
 }
 
+async function resolveGeminiModelName(force = false) {
+  if (!GEMINI_API_KEY) return null;
+
+  const now = Date.now();
+  if (!force && _resolvedModelName && now - _resolvedAt < MODEL_CACHE_MS) return _resolvedModelName;
+
+  if (!_genAI) _genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+
+  // 1) 如果 SDK 支援 listModels，就用它選出「真的可用、且支援 generateContent」的模型
+  try {
+    if (typeof _genAI.listModels === "function") {
+      const res = await _genAI.listModels();
+      const models = Array.isArray(res) ? res : (res?.models || []);
+      const available = new Set();
+
+      for (const m of models) {
+        const name = (m?.name || m?.model || "").toString();
+        if (!name) continue;
+
+        // 有些回傳會包含 supportedGenerationMethods
+        const methods = (m?.supportedGenerationMethods || m?.supportedMethods || []).map(String);
+        if (methods.length && !methods.includes("generateContent")) continue;
+
+        // SDK 允許用 "gemini-xxx"（不含 models/）
+        const short = name.startsWith("models/") ? name.slice("models/".length) : name;
+        available.add(short);
+      }
+
+      // 如果拿得到清單，就照偏好挑第一個存在的
+      for (const cand of GEMINI_MODEL_PREFERENCE) {
+        if (available.has(cand)) {
+          _resolvedModelName = cand;
+          _resolvedAt = now;
+          console.log(`🤖 Gemini model resolved: ${_resolvedModelName}`);
+          return _resolvedModelName;
+        }
+      }
+
+      // 沒匹配到偏好：挑一個看起來最像 flash 的
+      const flash = [...available].find((x) => x.includes("flash"));
+      const any = flash || [...available][0];
+      if (any) {
+        _resolvedModelName = any;
+        _resolvedAt = now;
+        console.log(`🤖 Gemini model auto-picked: ${_resolvedModelName}`);
+        return _resolvedModelName;
+      }
+    }
+  } catch (e) {
+    console.warn("⚠️ Gemini listModels failed, fallback by preference:", e?.message || e);
+  }
+
+  // 2) 沒清單就直接用偏好清單第一個（通常就會成功）
+  _resolvedModelName = GEMINI_MODEL_PREFERENCE[0] || "gemini-pro";
+  _resolvedAt = now;
+  console.log(`🤖 Gemini model fallback: ${_resolvedModelName}`);
+  return _resolvedModelName;
+}
+
+async function getGeminiModel(nameOverride = null) {
+  if (!_genAI) _genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+  const name = nameOverride || (await resolveGeminiModelName(false));
+  return _genAI.getGenerativeModel({
+    model: name,
+    systemInstruction: buildSystemPrompt(),
+  });
+}
+
 async function askGemini({ authorName, userText, userId }) {
   if (!GEMINI_API_KEY) {
     return `我現在腦袋還沒接上電（缺 GEMINI_API_KEY）😵‍💫\n叫管理員把環境變數補好啦～我才有魔力。`;
   }
 
-  const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-  const model = genAI.getGenerativeModel({
-    model: GEMINI_MODEL,
-    systemInstruction: buildSystemPrompt(),
-  });
-
   const history = convoMemory.get(userId) || [];
   const prompt = buildUserPrompt({ authorName, userText, history });
 
-  const result = await model.generateContent(prompt);
-  const text = result?.response?.text?.() || "";
-  return text.trim() || "……我剛剛腦袋打結了😵‍💫 你再說一次（或換個問法）";
+  // 第一次嘗試（用已解析/預設模型）
+  try {
+    const model = await getGeminiModel();
+    const result = await model.generateContent(prompt);
+    const text = result?.response?.text?.() || "";
+    return text.trim() || "……我剛剛腦袋打結了😵‍💫 你再說一次（或換個問法）";
+  } catch (e) {
+    const status = e?.status || e?.statusCode;
+    const msg = e?.message || "";
+
+    // 如果是 404（模型不存在/不支援），就依偏好清單逐個嘗試（避免你帳號沒開通某些模型）
+    if (
+      status === 404 ||
+      /models\/.+ is not found/i.test(msg) ||
+      /not supported for generateContent/i.test(msg)
+    ) {
+      console.warn("⚠️ Gemini model not found/unsupported, trying fallbacks...");
+      for (const cand of GEMINI_MODEL_PREFERENCE) {
+        try {
+          const model2 = await getGeminiModel(cand);
+          const result2 = await model2.generateContent(prompt);
+          const text2 = result2?.response?.text?.() || "";
+          if (text2 && text2.trim()) {
+            _resolvedModelName = cand;
+            _resolvedAt = Date.now();
+            console.log(`🤖 Gemini model switched to: ${_resolvedModelName}`);
+            return text2.trim();
+          }
+        } catch (e2) {
+          const s2 = e2?.status || e2?.statusCode;
+          const m2 = e2?.message || "";
+          // 只有遇到 404/不支援才繼續換模型，其它錯誤直接丟出
+          if (
+            s2 === 404 ||
+            /models\/.+ is not found/i.test(m2) ||
+            /not supported for generateContent/i.test(m2)
+          ) {
+            continue;
+          }
+          throw e2;
+        }
+      }
+      // 都不行：給一個清楚的訊息
+      return `我現在找不到可用的 Gemini 模型 😵‍💫\n請到 Google AI Studio 重新產生 API Key，或在 Render 設定 GEMINI_MODEL（例如：gemini-pro）。`;
+    }
+
+    // 其他錯誤就丟出去讓上層統一處理
+    throw e;
+  }
 }
 
 /* ===============================
