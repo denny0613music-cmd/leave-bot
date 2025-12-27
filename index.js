@@ -698,8 +698,7 @@ async function askGemini({ authorName, userText, userId }) {
       "- 禁止猜測、腦補或自行補完劇情。",
       "- 禁止混用不同版本或不同資料片內容。",
       "- 在可合理確定時要敢於下結論；不確定時才保守追問。",
-    ].join("
-");
+    ].join("\n");
 
 const facts = ff14.factText
       ? ff14.factText
