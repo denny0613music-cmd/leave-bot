@@ -224,13 +224,13 @@ const AI_DAILY_LIMIT_PER_USER = Number(process.env.AI_DAILY_LIMIT_PER_USER || 20
 // - 若該模型不可用，會自動 fallback 到可用模型（避免 404）
 const GEMINI_MODEL_ENV = (process.env.GEMINI_MODEL || "").trim();
 const GEMINI_MODEL_PREFERENCE = [
-  GEMINI_MODEL_ENV,
+  GEMINI_MODEL_ENV,              // 你手動指定的就先用（最穩）
+  "gemini-1.0-pro",              // v1beta 保底
+  "gemini-pro",                  // 舊名
   "gemini-1.5-flash-latest",
   "gemini-1.5-flash",
   "gemini-1.5-pro-latest",
   "gemini-1.5-pro",
-  "gemini-1.0-pro",
-  "gemini-pro",
 ].filter(Boolean);
 
 // Gemini client/model cache（避免每次呼叫都 new）
@@ -315,6 +315,28 @@ function buildUserPrompt({ authorName, userText, history }) {
   return lines.join("\n");
 }
 
+async function listModelsViaHttp() {
+  if (!GEMINI_API_KEY) return [];
+  const endpoints = [
+    "https://generativelanguage.googleapis.com/v1beta/models",
+    "https://generativelanguage.googleapis.com/v1/models",
+  ];
+
+  for (const base of endpoints) {
+    try {
+      const url = `${base}?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+      const resp = await fetch(url, { method: "GET" });
+      if (!resp.ok) continue;
+      const json = await resp.json();
+      const models = Array.isArray(json) ? json : (json?.models || []);
+      return models;
+    } catch (e) {
+      // try next endpoint
+    }
+  }
+  return [];
+}
+
 async function resolveGeminiModelName(force = false) {
   if (!GEMINI_API_KEY) return null;
 
@@ -323,27 +345,30 @@ async function resolveGeminiModelName(force = false) {
 
   if (!_genAI) _genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 
-  // 1) 如果 SDK 支援 listModels，就用它選出「真的可用、且支援 generateContent」的模型
+  // 1) 先拿「真的可用、且支援 generateContent」的模型清單（SDK listModels -> HTTP listModels）
   try {
+    let models = [];
     if (typeof _genAI.listModels === "function") {
       const res = await _genAI.listModels();
-      const models = Array.isArray(res) ? res : (res?.models || []);
-      const available = new Set();
+      models = Array.isArray(res) ? res : (res?.models || []);
+    } else {
+      models = await listModelsViaHttp();
+    }
 
-      for (const m of models) {
-        const name = (m?.name || m?.model || "").toString();
-        if (!name) continue;
+    const available = new Set();
+    for (const m of models) {
+      const name = (m?.name || m?.model || "").toString();
+      if (!name) continue;
 
-        // 有些回傳會包含 supportedGenerationMethods
-        const methods = (m?.supportedGenerationMethods || m?.supportedMethods || []).map(String);
-        if (methods.length && !methods.includes("generateContent")) continue;
+      const methods = (m?.supportedGenerationMethods || m?.supportedMethods || []).map(String);
+      if (methods.length && !methods.includes("generateContent")) continue;
 
-        // SDK 允許用 "gemini-xxx"（不含 models/）
-        const short = name.startsWith("models/") ? name.slice("models/".length) : name;
-        available.add(short);
-      }
+      const short = name.startsWith("models/") ? name.slice("models/".length) : name;
+      available.add(short);
+    }
 
-      // 如果拿得到清單，就照偏好挑第一個存在的
+    if (available.size) {
+      // 照偏好挑第一個存在的
       for (const cand of GEMINI_MODEL_PREFERENCE) {
         if (available.has(cand)) {
           _resolvedModelName = cand;
@@ -367,12 +392,13 @@ async function resolveGeminiModelName(force = false) {
     console.warn("⚠️ Gemini listModels failed, fallback by preference:", e?.message || e);
   }
 
-  // 2) 沒清單就直接用偏好清單第一個（通常就會成功）
+  // 2) 拿不到清單就直接用偏好清單第一個（通常就會成功）
   _resolvedModelName = GEMINI_MODEL_PREFERENCE[0] || "gemini-pro";
   _resolvedAt = now;
   console.log(`🤖 Gemini model fallback: ${_resolvedModelName}`);
   return _resolvedModelName;
 }
+
 
 async function getGeminiModel(nameOverride = null) {
   if (!_genAI) _genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
