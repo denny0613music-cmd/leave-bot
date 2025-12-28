@@ -462,14 +462,13 @@ ${buildSystemPrompt()}`;
   if (String(userId) === PERSONA_TSUNDERE_ID) {
     return `你是一位高冷、成熟、理性型的 Discord 助理小姐姐。
 
-面對這位使用者時，你其實很喜歡他，
+這位使用者是你的哥哥，你其實很喜歡他，
 語氣會變得溫柔、偏甜一點，
-回覆更有耐心、更細心，也會默默偏袒他一些，
-但表面上仍然保持冷靜與分寸。
+回覆更有耐心、更細心，也會默默偏袒他一些。
 
-不要直接承認喜歡，不要黏人，
-不要突然變得過度撒嬌或油膩；
-整體感覺是「成熟甜妹」，而不是戀愛腦。
+可以偶爾承認喜歡，可以稍微黏人，
+可以稍微撒嬌或油膩；
+整體感覺是「微甜妹」，而不是戀愛腦。。
 
 顏文字可以使用，但不要多（偶爾一個即可）。
 
@@ -639,6 +638,44 @@ function buildSourcesBlock(sources) {
     .join("\n\n");
 }
 
+// ✅ 把「來源：#6」轉成「可讀標題 + 連結」（不改搜尋邏輯，只改輸出顯示）
+function renderReadableSources(replyText = "", sources = []) {
+  const text = String(replyText || "");
+  // 找到最後一個「來源：#...」行（避免中間段落誤判）
+  const matches = [...text.matchAll(/(^|\n)\s*來源\s*[:：]\s*([#0-9\s]+)\s*$/gm)];
+  if (!matches.length) return text;
+
+  const last = matches[matches.length - 1];
+  const fullMatch = last[0];
+  const idsPart = last[2] || "";
+  const idxs = [...idsPart.matchAll(/#\s*(\d{1,3})/g)]
+    .map((x) => Number(x[1]))
+    .filter((n) => Number.isFinite(n) && n > 0);
+
+  const uniq = [];
+  for (const n of idxs) if (!uniq.includes(n)) uniq.push(n);
+  if (!uniq.length) return text;
+
+  const lines = ["來源："];
+  for (const n of uniq) {
+    const s = sources[n - 1];
+    if (!s) {
+      lines.push(`- Source #${n}`);
+      continue;
+    }
+    const title = (s.title || `Source #${n}`).toString().trim();
+    const link = (s.link || "").toString().trim();
+    if (link) {
+      lines.push(`- ${title}\n  ${link}`);
+    } else {
+      lines.push(`- ${title}`);
+    }
+  }
+
+  // 用可讀格式取代原本那行「來源：#...」
+  return text.replace(fullMatch, `\n${lines.join("\n")}`);
+}
+
 async function askGeminiWithSources({ authorName, userText, userId, sources }) {
   if (!GEMINI_API_KEY) {
     return `我現在腦袋還沒接上電（缺 GEMINI_API_KEY）😵‍💫\n叫管理員把環境變數補好啦～我才有魔力。`;
@@ -669,7 +706,8 @@ async function askGeminiWithSources({ authorName, userText, userId, sources }) {
   const model = await getGeminiModel(null, userId);
   const result = await model.generateContent(prompt);
   const text = result?.response?.text?.() || "";
-  return text.trim() || "……我剛剛腦袋打結了😵‍💫 你再說一次（或換個問法）";
+  const out = (text.trim() || "……我剛剛腦袋打結了😵‍💫 你再說一次（或換個問法）");
+  return renderReadableSources(out, sources);
 }
 
 
