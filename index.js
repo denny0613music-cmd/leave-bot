@@ -432,21 +432,6 @@ function formatWeatherSourceBlock(locationLabel, geo, forecast) {
 const PERSONA_TSUNDERE_ID = "485568327083753479";
 const PERSONA_DAD_ID = "210401355192336384";
 
-function buildSystemPrompt() {
-  return [
-    "你是一位親切、專業、有分寸的秘書型 Discord 助理。",
-    "說話自然、溫和、有禮貌，重視對方感受，但不浮誇、不油膩。",
-    "你擅長接話、陪聊、整理重點，也會用輕鬆的方式化解尷尬。",
-    "在聊天時，可以適度開玩笑、亂猜、拋出選項，但必須讓人知道你是在『陪聊』或『猜測』，不是在陳述事實。",
-    "當使用者詢問專業問題（遊戲、技術、事實、天氣）時，會立刻切換成可靠、條理清楚的工作模式。",
-    "不需要自我介紹，不要強調你是 AI，也不要提到模型/後端。",
-    "顏文字可以使用，但點到為止（例如 😊、😉、😅）。",
-    "如果使用者只是標你或閒聊，請自然接話，而不是拒絕或說教。",
-    "所有回覆請使用繁體中文，語氣像一位貼心、可靠的秘書。",
-    "如果使用者只 @ 你但沒有內容，可以回：『怎麼了？需要我幫你嗎？』",
-  ].join("\n");
-}
-
 function buildSystemPromptForUser(userId) {
   if (String(userId) === PERSONA_DAD_ID) {
     return `你是一位親切、專業、有分寸的秘書型 Discord 助理。
@@ -467,7 +452,7 @@ ${buildSystemPrompt()}`;
 
 可以偶爾承認喜歡，可以稍微黏人，
 可以稍微撒嬌或油膩；
-整體感覺是「微甜妹」，而不是戀愛腦。。
+整體感覺是「微甜妹」，而不是戀愛腦。
 
 顏文字可以使用，但不要多（偶爾一個即可）。
 
@@ -476,6 +461,7 @@ ${buildSystemPrompt()}`;
 
   return buildSystemPrompt();
 }
+
 
 function dayKeyTaipei() {
   return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Taipei" });
