@@ -859,10 +859,129 @@ async function googleLikeAnswer({ authorName, userText, userId }) {
   return await askGeminiWithSources({ authorName, userText, userId, sources });
 }
 
-async function askGemini({ authorName, userText, userId }) {
-  // ✅ 重要：改成「先查再答」
+
+async function askGeminiSearch({ authorName, userText, userId }) {
+  // ✅ 查詢：維持原本「先查再答」
   return await googleLikeAnswer({ authorName, userText, userId });
 }
+
+/* ===============================
+   Intent Router（聊天 vs 查詢）
+   ✅ 聊天：禁止搜尋/天氣 API（避免亂查歌名/亂貼來源）
+   ✅ 查詢：維持原本 Google-like（先查再答 + 附來源）
+   ⚠️ 規則：不確定一律當 chat（保守）
+================================ */
+
+// 硬規則：一看到這些詞，直接當聊天（不查資料）
+const HARD_CHAT_PATTERNS = [
+  /我是你的誰/,
+  /你是誰/,
+  /我們是什麼關係/,
+  /關係/,
+  /爸爸/,
+  /哥哥/,
+  /主人/,
+  /喜歡我/,
+  /愛我/,
+  /想我/,
+  /在嗎/,
+  /陪我/,
+  /心情/,
+  /難過|傷心|不爽|生氣|鬱悶|焦慮/,
+];
+
+// 硬規則：一看到這些詞，直接當查詢（可查資料）
+const HARD_SEARCH_PATTERNS = [
+  /新聞|news/i,
+  /價格|價錢|多少錢|幾塊|匯率|股價|bitcoin|btc|eth/i,
+  /教學|教程|怎麼做|如何|步驟|設定|安裝|修復|錯誤|error|bug/i,
+];
+
+function heuristicIntent(text = "") {
+  const t = String(text || "").trim();
+  if (!t) return "chat"; // 只 @ 但沒內容：聊天接話
+
+  // 先用硬規則判斷（最穩）
+  if (HARD_CHAT_PATTERNS.some((re) => re.test(t))) return "chat";
+  if (isWeatherQuery(t)) return "search";
+  if (HARD_SEARCH_PATTERNS.some((re) => re.test(t))) return "search";
+
+  // 「我/你/我們 + 誰/什麼」這種多半是聊天（例如：我是你的誰）
+  if (/(我|你|我們).{0,6}(誰|什麼)/.test(t) && /你/.test(t)) return "chat";
+
+  // 其他交給 AI 判斷（但 AI 判斷不出來就回 chat）
+  return "unknown";
+}
+
+async function classifyIntentByGemini(userText = "", userId = null) {
+  // 沒有 Gemini key：只能用 heuristic（仍然保守）
+  if (!GEMINI_API_KEY) return "chat";
+
+  const quick = heuristicIntent(userText);
+  if (quick === "chat" || quick === "search") return quick;
+
+  // 用同一個模型，但用「分類器指令」強制只輸出 chat/search
+  const classifierPrompt = [
+    "你是一個『意圖判斷器』，不是聊天機器人。",
+    "請判斷使用者訊息屬於哪一類，只能回傳一個關鍵字：",
+    "",
+    "【chat】關係、身分、情緒、玩笑、調情、稱呼（哥哥/爸爸/主人）、主觀感受；不需要查資料就能回。",
+    "【search】明確事實、數字、地點、時間；天氣/新聞/知識/教學；需要查資料或可驗證來源。",
+    "",
+    "規則：",
+    "1) 只能輸出 chat 或 search，不能有其他字。",
+    "2) 只要有一點不確定，一律輸出 chat。",
+    "3) 人際關係/情緒/稱呼 一律輸出 chat。",
+    "",
+    "使用者訊息：",
+    userText || "",
+  ].join("\n");
+
+  try {
+    const model = await getGeminiModel(null, userId);
+    const result = await model.generateContent(classifierPrompt);
+    const out = (result?.response?.text?.() || "").trim().toLowerCase();
+
+    if (out === "search" || out === "chat") return out;
+
+    // 有時會回 "chat\n" 或 "chat." 之類：做一次容錯
+    const m = out.match(/\b(chat|search)\b/);
+    if (m && m[1]) return m[1];
+
+    return "chat";
+  } catch (e) {
+    console.warn("⚠️ intent classifier error:", e?.message || e);
+    return "chat";
+  }
+}
+
+async function askGeminiChat({ authorName, userText, userId }) {
+  if (!GEMINI_API_KEY) {
+    return "我現在腦袋還沒接上電（缺 GEMINI_API_KEY）。叫管理員把環境變數補好。";
+  }
+
+  const history = convoMemory.get(userId) || [];
+
+  // ✅ 聊天模式：明確禁止搜尋/附來源/貼連結
+  const chatMode = [
+    "你現在在進行日常聊天。",
+    "規則：不要查資料、不要提供來源、不要列連結、不要引用外部網站。",
+    "保持你的人格設定（高冷成熟、有分寸），用繁體中文，簡短自然。",
+    "如果使用者只是在確認關係或開玩笑，就用聊天方式接話，不要變成百科或搜尋結果。",
+  ].join("\n");
+
+  const prompt = [
+    chatMode,
+    "",
+    buildUserPrompt({ authorName, userText, history }),
+  ].join("\n");
+
+  const model = await getGeminiModel(null, userId);
+  const result = await model.generateContent(prompt);
+  const text = result?.response?.text?.() || "";
+  return (text.trim() || "……");
+}
+
 
 /* ===============================
    Message handler（AI：只回指定頻道 @Bot）
@@ -913,11 +1032,20 @@ client.on("messageCreate", async (message) => {
 
     let replyText = "";
     try {
-      replyText = await askGemini({
-        authorName: message.author?.username || "使用者",
-        userText: userText || "",
-        userId: message.author.id,
-      });
+      const intent = await classifyIntentByGemini(userText || "", message.author.id);
+
+      replyText =
+        intent === "search"
+          ? await askGeminiSearch({
+              authorName: message.author?.username || "使用者",
+              userText: userText || "",
+              userId: message.author.id,
+            })
+          : await askGeminiChat({
+              authorName: message.author?.username || "使用者",
+              userText: userText || "",
+              userId: message.author.id,
+            });
     } catch (e) {
       console.error("❌ AI error:", e);
       replyText = "我剛剛連線斷了一下。再 @ 我一次，或把關鍵字說完整點。";
