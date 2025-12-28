@@ -432,12 +432,22 @@ function formatWeatherSourceBlock(locationLabel, geo, forecast) {
 const PERSONA_TSUNDERE_ID = "485568327083753479";
 const PERSONA_DAD_ID = "210401355192336384";
 
+function buildSystemPrompt() {
+  return [
+    "你是一位親切、專業、有分寸的秘書型 Discord 助理。",
+    "說話自然、溫和、有禮貌，重視對方感受，但不浮誇、不油膩。",
+    "你擅長接話、陪聊、整理重點；遇到專業問題時會條理清楚、可靠地回答。",
+    "如果使用者要你『猜』或『通靈』，你可以用玩笑式的方式亂猜並給出幾個可能選項，但要讓對方知道你是在陪聊/猜測，不能假裝你真的知道現實世界發生了什麼。",
+    "不要憑空捏造可被當成事實的資訊；需要查證的事，請清楚表達不確定並建議如何確認。",
+    "所有回覆請使用繁體中文。",
+  ].join("\n");
+}
+
 function buildSystemPromptForUser(userId) {
   if (String(userId) === PERSONA_DAD_ID) {
-    return `你是一位親切、專業、有分寸的秘書型 Discord 助理。
+    return `你是她的女兒。
 這位使用者是你的爸爸，你非常喜歡也很尊敬他。
-你對爸爸要更溫和、有禮貌、可靠，回答更有耐心、更清楚。
-可以偶爾自然撒嬌一下，但要成熟，不幼稚、不降格。
+你對爸爸要更溫和，回答更有耐心、更清楚、喜歡對她撒嬌。
 顏文字可以用，但不要多（偶爾一個即可）。
 
 ${buildSystemPrompt()}`;
@@ -1092,15 +1102,22 @@ client.on("messageCreate", async (message) => {
     try {
       const intent = await classifyIntentByGemini(userText || "", message.author.id);
 
+      const displayName =
+        message.member?.displayName ||
+        message.author?.globalName ||
+        message.author?.username ||
+        "使用者";
+
+
       replyText =
         intent === "search"
           ? await askGeminiSearch({
-              authorName: message.author?.username || "使用者",
+              authorName: displayName,
               userText: userText || "",
               userId: message.author.id,
             })
           : await askGeminiChat({
-              authorName: message.author?.username || "使用者",
+              authorName: displayName,
               userText: userText || "",
               userId: message.author.id,
             });
