@@ -624,22 +624,90 @@ async function getGeminiModel(nameOverride = null, userId = null) {
 /* ===============================
    Google-like Answer: 先做 Sources，再讓 AI 只能根據 Sources 回答
 ================================ */
-function buildSourcesBlock(sources) {
+
+function extractRemainingCount(userText = "") {
+  const t = String(userText || "");
+  // 常見寫法：剩30個 / 剩下 30 個 / 還有30個
+  const m = t.match(/(?:剩下?|還有|尚剩|remaining)\s*([0-9]{1,3})\s*(?:個)?/i);
+  if (m && m[1]) return Number(m[1]);
+  return null;
+}
+
+function isRemainingTimeQuery(userText = "") {
+  const t = String(userText || "");
+  return /(多久|幾小時|幾個小時|時間|要花|花多久|需要多久)/.test(t) &&
+    /(主線|主线|msq|任務|任务)/i.test(t) &&
+    /(剩下?|還有|尚剩|remaining)/i.test(t);
+}
+
+// 估算器：後期 MSQ 20~30 分/個 + 排隊/跑圖加成（保守）
+function estimateRemainingMsqHours(userText = "") {
+  const n = extractRemainingCount(userText);
+  if (!n) return null;
+
+  const lowMin = n * 20;
+  const highMin = n * 30;
+
+  // 若使用者提到 DPS / 坦 / 補，簡單調整排隊加成
+  const t = String(userText || "").toLowerCase();
+  let queueLowH = 2, queueHighH = 6; // 預設（未知職業）
+  if (/(坦|tank)/.test(t) || /(補|补|healer)/.test(t)) { queueLowH = 1; queueHighH = 4; }
+  if (/(dps|輸出|输出)/.test(t)) { queueLowH = 3; queueHighH = 8; }
+
+  const baseLowH = lowMin / 60;
+  const baseHighH = highMin / 60;
+
+  const totalLowH = Math.max(0, baseLowH + queueLowH);
+  const totalHighH = Math.max(totalLowH, baseHighH + queueHighH);
+
+  const detail = `以後期 MSQ 約 20–30 分/個估算（不含/含排隊與跑圖保守加成）`;
+  return { n, totalLowH, totalHighH, detail };
+}
+
+// 對齊檢查：標記來源在講「整段旅程」而不是「剩 N 個」
+function alignmentNote(userText = "", source = {}) {
+  const t = String(userText || "");
+  const hasRemaining = /(剩下?|還有|尚剩|remaining)/i.test(t) && /[0-9]{1,3}/.test(t);
+
+  const blob = `${source?.title || ""} ${source?.snippet || ""}`.toLowerCase();
+
+  // 常見不對齊：from 50 to max / 50 到滿等 / 200-300 hours
+  const looksWholeJourney =
+    /(from\s*50\s*to\s*max|50\s*(?:到|至)\s*滿等|to\s*max|1\s*to\s*max)/i.test(blob) ||
+    /200\s*[-~–]\s*300\s*hours/.test(blob) ||
+    /(a\s*realm\s*reborn|heavensward|stormblood)/.test(blob);
+
+  if (hasRemaining && looksWholeJourney) return "（範圍不同：這篇多半在算『從頭到滿等/整段旅程』，不是『剩餘任務』）";
+  return "";
+}
+
+function formatEstimateBlock(userText = "") {
+  const est = estimateRemainingMsqHours(userText);
+  if (!est) return "";
+  const low = Math.round(est.totalLowH);
+  const high = Math.round(est.totalHighH);
+  const range = low === high ? `${low}` : `${low}–${high}`;
+  return `【估算】剩餘 ${est.n} 個主線任務：約 ${range} 小時\n（${est.detail}）`;
+}
+
+function buildSourcesBlock(sources, userText = "") {
   if (!sources?.length) return "（沒有取得可用來源）";
   return sources
     .slice(0, 8)
     .map((s, i) => {
       const idx = i + 1;
       const title = s.title ? String(s.title) : `Source #${idx}`;
+      const note = alignmentNote(userText, s);
+      const titleLine = note ? `${title} ${note}` : title;
       const snippet = s.snippet ? String(s.snippet) : "";
       const link = s.link ? String(s.link) : "";
-      return `[#${idx}] ${title}\n${snippet}\nSource: ${link}`.trim();
+      return `[#${idx}] ${titleLine}\n${snippet}\nSource: ${link}`.trim();
     })
     .join("\n\n");
 }
 
 // ✅ 把「來源：#6」轉成「可讀標題 + 連結」（不改搜尋邏輯，只改輸出顯示）
-function renderReadableSources(replyText = "", sources = []) {
+function renderReadableSources(replyText = "", sources = [], userText = "") {
   const text = String(replyText || "");
   // 找到最後一個「來源：#...」行（避免中間段落誤判）
   const matches = [...text.matchAll(/(^|\n)\s*來源\s*[:：]\s*([#0-9\s]+)\s*$/gm)];
@@ -664,11 +732,13 @@ function renderReadableSources(replyText = "", sources = []) {
       continue;
     }
     const title = (s.title || `Source #${n}`).toString().trim();
+    const note = alignmentNote(userText, s);
+    const titleLine = note ? `${title} ${note}` : title;
     const link = (s.link || "").toString().trim();
     if (link) {
-      lines.push(`- ${title}\n  ${link}`);
+      lines.push(`- ${titleLine}\n  ${link}`);
     } else {
-      lines.push(`- ${title}`);
+      lines.push(`- ${titleLine}`);
     }
   }
 
@@ -682,7 +752,7 @@ async function askGeminiWithSources({ authorName, userText, userId, sources }) {
   }
 
   const history = convoMemory.get(userId) || [];
-  const sourcesBlock = buildSourcesBlock(sources);
+  const sourcesBlock = buildSourcesBlock(sources, userText);
 
   const system = `
 你必須「只根據 Sources」回答，不准自行腦補。
@@ -707,7 +777,9 @@ async function askGeminiWithSources({ authorName, userText, userId, sources }) {
   const result = await model.generateContent(prompt);
   const text = result?.response?.text?.() || "";
   const out = (text.trim() || "……我剛剛腦袋打結了😵‍💫 你再說一次（或換個問法）");
-  return renderReadableSources(out, sources);
+  const estBlock = isRemainingTimeQuery(userText) ? formatEstimateBlock(userText) : "";
+  const finalOut = estBlock ? `${estBlock}\n\n${out}` : out;
+  return renderReadableSources(finalOut, sources, userText);
 }
 
 
