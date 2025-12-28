@@ -649,6 +649,7 @@ async function askGeminiWithSources({ authorName, userText, userId, sources }) {
 
   const system = `
 你必須「只根據 Sources」回答，不准自行腦補。
+- 若 Sources 內有明確數字證據（例如「主線任務62」「第62個」），你必須直接給出該數字結論。
 - 若 Sources 沒有足夠資訊：直接說「查不到/不確定」，並建議使用者補充關鍵字。
 - 若 Sources 互相矛盾：指出矛盾，並偏向官方/權威來源。
 - 回答用繁體中文，條列、簡潔。
@@ -671,8 +672,118 @@ async function askGeminiWithSources({ authorName, userText, userId, sources }) {
   return text.trim() || "……我剛剛腦袋打結了😵‍💫 你再說一次（或換個問法）";
 }
 
+
+/* ===============================
+   FF14：任務「第幾個」的硬查證（避免 Sources snippet 沒帶數字導致 AI 說不確定）
+   ✅ 只加在 Google-like 搜尋流程內，不動其他架構/人格
+================================ */
+function isFfxivMsqOrdinalQuery(text = "") {
+  const t = String(text || "");
+  return /(ff14|ffxiv|最終幻想14|太空戰士14|暗影之逆焰|5\.0|主線|主线)/i.test(t) &&
+    /(第幾個|第几个|第幾|第几|序號|順序|順番|任務順序|任务顺序)/i.test(t);
+}
+
+// 從句子裡抓最像「任務/副本名稱」的片段（例如：奇坦那神影洞）
+function extractLikelyQuestName(text = "") {
+  const t = String(text || "");
+  const q = t.match(/[「『【](.+?)[」』】]/);
+  if (q && q[1] && q[1].length >= 2) return q[1].trim();
+
+  // 抓所有連續中文片段，濾掉常見功能詞，取最長者
+  const parts = (t.match(/[\u4e00-\u9fff]{2,20}/g) || [])
+    .map((s) => s.trim())
+    .filter((s) => s && !/(主線|主线|任務|任务|版本|第幾|第几|哪個|哪个|詳細|详细|資料|资料|順序|顺序|FF14|FFXIV|暗影之逆焰)/i.test(s));
+
+  if (!parts.length) return "";
+  parts.sort((a, b) => b.length - a.length);
+  return parts[0];
+}
+
+// 從搜尋結果 snippet/title 抽出「主線任務N / 第N個」這種明確序號
+function extractOrdinalFromText(text = "") {
+  const t = String(text || "");
+  let m = t.match(/主[线線]\s*任務?\s*([0-9]{1,3})/);
+  if (m && m[1]) return Number(m[1]);
+  m = t.match(/第\s*([0-9]{1,3})\s*個/);
+  if (m && m[1]) return Number(m[1]);
+  return null;
+}
+
+async function tryFindFfxivMsqOrdinalEvidence(userText) {
+  const quest = extractLikelyQuestName(userText);
+  if (!quest) return { evidence: null, extraSources: [] };
+
+  // 用更「會帶數字」的關鍵字去逼出 snippet 裡出現序號
+  const queries = [
+    `FF14 ${quest} 主線任務 第幾個`,
+    `FF14 ${quest} 主线任务 第几个`,
+    `暗影之逆焰 ${quest} 主線任務`,
+    `Shadowbringers ${quest} MSQ quest order`,
+  ];
+
+  const extraSources = [];
+  let best = null;
+
+  for (const q of queries) {
+    const rs = await serperSearch(q);
+    for (const item of rs) {
+      extraSources.push(item);
+      const ord = extractOrdinalFromText(`${item.title || ""} ${item.snippet || ""}`);
+      if (ord != null && !best) {
+        best = { ordinal: ord, source: item, quest };
+      }
+    }
+    if (best) break;
+  }
+
+  // 再補一個「直接找 主線任務 + 數字」的 query（有些站會在標題放：主线任务62）
+  if (!best) {
+    const rs2 = await serperSearch(`"${quest}" 主线任务`);
+    for (const item of rs2) {
+      extraSources.push(item);
+      const ord = extractOrdinalFromText(`${item.title || ""} ${item.snippet || ""}`);
+      if (ord != null) {
+        best = { ordinal: ord, source: item, quest };
+        break;
+      }
+    }
+  }
+
+  // 產出一個「可直接引用」的證據來源（仍然附 URL，符合 Google-like）
+  if (best?.source?.link) {
+    const ev = {
+      title: `FF14 主線序號證據：${best.quest}`,
+      snippet: `在搜尋結果中找到明確序號：主線任務 ${best.ordinal}\n（從標題/摘要抽取）\n對應來源：${best.source.title}\n${best.source.snippet || ""}`.trim(),
+      link: best.source.link,
+    };
+    return { evidence: ev, extraSources };
+  }
+
+  return { evidence: null, extraSources };
+}
+
 async function googleLikeAnswer({ authorName, userText, userId }) {
   const sources = [];
+
+  // 0) FF14：主線任務「第幾個」——先做硬查證，把「帶數字」的來源塞進 Sources（避免 AI 說查不到）
+  if (isFfxivMsqOrdinalQuery(userText)) {
+    try {
+      const { evidence, extraSources } = await tryFindFfxivMsqOrdinalEvidence(userText);
+      const seen = new Set();
+      if (evidence?.link) {
+        sources.push(evidence);
+        seen.add(evidence.link);
+      }
+      for (const s of extraSources || []) {
+        const link = s?.link || "";
+        if (!link || seen.has(link)) continue;
+        sources.push(s);
+        seen.add(link);
+      }
+    } catch (e) {
+      console.warn("⚠️ FF14 ordinal evidence lookup failed:", e?.message || e);
+    }
+  }
 
   // 1) 天氣：用 Open-Meteo（準確性優先）
   if (WEATHER_PROVIDER === "openmeteo" && isWeatherQuery(userText)) {
