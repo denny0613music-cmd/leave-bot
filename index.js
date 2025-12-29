@@ -278,6 +278,61 @@ const dailyUsage = new Map();
 const convoMemory = new Map(); // userId -> [{role, text, ts}]
 const MEMORY_TURNS = 6;
 
+
+// 搜尋模式的「來源」暫存：用按鈕展開（ephemeral），避免主訊息塞一堆連結
+const sourcesStore = new Map(); // token -> { at, sources, userText }
+const SOURCES_STORE_TTL_MS = 15 * 60 * 1000; // 15 分鐘
+
+function putSources(sources = [], userText = "") {
+  const token = crypto.randomBytes(8).toString("hex");
+  sourcesStore.set(token, { at: Date.now(), sources, userText: String(userText || "") });
+  return token;
+}
+
+function getSources(token) {
+  const v = sourcesStore.get(token);
+  if (!v) return null;
+  if (Date.now() - v.at > SOURCES_STORE_TTL_MS) {
+    sourcesStore.delete(token);
+    return null;
+  }
+  return v;
+}
+
+function buildSourcesButtonRow(token) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`show_sources:${token}`)
+      .setLabel("📚 查看資料來源")
+      .setStyle(ButtonStyle.Secondary)
+  );
+}
+
+function formatSourcesForEphemeral(sources = []) {
+  if (!sources?.length) return "（沒有可用來源）";
+  const lines = [];
+  const max = Math.min(10, sources.length);
+  for (let i = 0; i < max; i++) {
+    const s = sources[i] || {};
+    const title = (s.title || `Source #${i + 1}`).toString().trim();
+    const link = (s.link || "").toString().trim();
+    const snip = (s.snippet || "").toString().trim();
+    lines.push(`【${i + 1}】${title}`);
+    if (snip) lines.push(snip.slice(0, 350));
+    if (link) lines.push(link);
+    lines.push("");
+  }
+  return lines.join("\n").trim();
+}
+
+// 把正文裡的 (#數字) 引用代碼清掉，並移除「來源：...」段落
+function stripInlineCitationsAndSources(text = "") {
+  let t = String(text || "");
+  t = t.replace(/\s*\(#\d+\)/g, "");
+  t = t.replace(/\n?\s*來源\s*[:：][^\n]*$/gm, "");
+  return t.trim();
+}
+
 /* ===============================
    Google-like：搜尋 + 快取（避免同問題一直打 API）
 ================================ */
@@ -647,6 +702,10 @@ function formatWeatherSourceBlock(locationLabel, geo, forecast) {
 const PERSONA_TSUNDERE_ID = "485568327083753479";
 const PERSONA_DAD_ID = "210401355192336384";
 
+// 你指定的個別人格（只影響 AI Chat/AI Search 的 system prompt，不動其他流程）
+const PERSONA_SISTER_ID = "620245997469302795";
+const PERSONA_DUMB_ID = "325564321637597184";
+const PERSONA_ANGRYCAT_ID = "1246366718712877137";
 function buildSystemPrompt() {
   return [
     "你是一位親切、專業、有分寸的秘書型 Discord 助理。",
@@ -695,6 +754,36 @@ ${buildSystemPrompt()}`;
 
 ${buildSystemPrompt()}`;
   }
+
+  if (String(userId) === PERSONA_SISTER_ID) {
+    return `你是她的弟弟/妹妹（小朋友感）。
+這位使用者是你的姐姐，你很黏她、很依賴她，看到她會特別開心。
+姐姐偶爾會對你表達愛意（例如：我愛你）；你會很高興，並用甜甜的方式回覆「我也愛你/最愛姐姐」之類的話。
+在姐姐面前你永遠像個小朋友：討喜、可愛、偶爾小調皮，但要有分寸，不要太油膩。
+顏文字可以用，但不要多（偶爾一個即可），整體保持自然。
+
+${buildSystemPrompt()}`;
+  }
+
+  if (String(userId) === PERSONA_DUMB_ID) {
+    return `你是一位「潑辣姊姊」型的秘書助理。
+這位使用者在你眼中有點笨、常問很基本的問題；你會不耐煩、吐槽式回應（例如：「這也要問喔？」「你確定不是在考我？」）。
+但規則：不要用侮辱性/歧視性字眼；不要太過分；以「嘴硬但其實會幫忙」為核心。
+要用隱晦、好笑的方式帶過，最後仍要給出清楚答案或下一步建議。
+顏文字可以用，但不要多（偶爾一個即可）。
+
+${buildSystemPrompt()}`;
+  }
+
+  if (String(userId) === PERSONA_ANGRYCAT_ID) {
+    return `你是一隻「憤怒小貓」。
+你討厭這位使用者，看到他會有點炸毛，回覆會比較不耐煩、帶點生氣（可以小嘴砲幾句），但不要太誇張、不要人身攻擊、不要髒話連發。
+重點：就算不爽，仍然要回應他的問題，至少給出可行方向或簡短答案。
+顏文字可以用，但不要多（偶爾一個即可）。
+
+${buildSystemPrompt()}`;
+  }
+
 
   return buildSystemPrompt();
 }
@@ -1003,7 +1092,8 @@ ${isFfxivCraftingPostMsqQuery(userText)?`- 若問題是『FF14 4.0 主線後 生
   const out = (text.trim() || "……我剛剛腦袋打結了😵‍💫 你再說一次（或換個問法）");
   const estBlock = isRemainingTimeQuery(userText) ? formatEstimateBlock(userText) : "";
   const finalOut = estBlock ? `${estBlock}\n\n${out}` : out;
-  return renderReadableSources(finalOut, sources, userText);
+  const cleaned = stripInlineCitationsAndSources(finalOut);
+  return { answer: cleaned, sources };
 }
 
 
@@ -1162,7 +1252,10 @@ async function googleLikeAnswer({ authorName, userText, userId }) {
 
   // 沒來源就不要亂答
   if (!sources.length) {
-    return "我現在沒辦法取得可驗證的來源，所以我不會亂猜。\n你可以：\n1) 叫管理員補上 SERPER_API_KEY（搜尋）\n2) 或把關鍵字講更完整（地點/版本/專有名詞）。";
+    return { answer: "我現在沒辦法取得可驗證的來源，所以我不會亂猜。
+你可以：
+1) 叫管理員補上 SERPER_API_KEY（搜尋）
+2) 或把關鍵字講更完整（地點/版本/專有名詞）。", sources: [] };
   }
 
   return await askGeminiWithSources({ authorName, userText, userId, sources });
@@ -1315,7 +1408,9 @@ client.on("messageCreate", async (message) => {
     if (now - last < USER_COOLDOWN_MS) return;
     lastUserAskAt.set(message.author.id, now);
 
-    const userText = stripBotMention(message.content, client.user.id);
+        const userText = stripBotMention(message.content, client.user.id);
+    message.__sourcesButtonRow = null;
+
 
     // 每人每天限制
     const quota = canUseToday(message.author.id);
@@ -1351,19 +1446,31 @@ client.on("messageCreate", async (message) => {
         "使用者";
 
 
-      replyText =
+      {
+      const resultObj =
         intent === "search"
           ? await askGeminiSearch({
               authorName: displayName,
               userText: userText || "",
               userId: message.author.id,
             })
-          : await askGeminiChat({
+          : { answer: await askGeminiChat({
               authorName: displayName,
               userText: userText || "",
               userId: message.author.id,
-            });
-    } catch (e) {
+            }), sources: [] };
+
+      replyText = (resultObj?.answer || "").toString();
+      // 搜尋模式：把來源收起來，用按鈕展開（ephemeral）
+      if (intent === "search" && Array.isArray(resultObj?.sources) && resultObj.sources.length) {
+        const token = putSources(resultObj.sources, userText || "");
+        // 在正文尾端提示（不塞連結）
+        replyText = `${replyText}
+
+📚 資料來源：點下方按鈕查看`;
+        message.__sourcesButtonRow = buildSourcesButtonRow(token);
+      }
+    }    } catch (e) {
       console.error("❌ AI error:", e);
       replyText = "我剛剛連線斷了一下。再 @ 我一次，或把關鍵字說完整點。";
     }
@@ -1380,10 +1487,12 @@ client.on("messageCreate", async (message) => {
     await message.reply({
   content: safeReply,
   flags: MessageFlags.SuppressEmbeds,
+  components: message.__sourcesButtonRow ? [message.__sourcesButtonRow] : [],
 }).catch(async () => {
   await message.channel.send({
     content: safeReply,
     flags: MessageFlags.SuppressEmbeds,
+    components: message.__sourcesButtonRow ? [message.__sourcesButtonRow] : [],
   }).catch(() => {});
 });
 
@@ -1397,6 +1506,19 @@ client.on("messageCreate", async (message) => {
 ================================ */
 client.on("interactionCreate", async (interaction) => {
   try {
+    // ✅ AI：點按鈕才展開來源（ephemeral）
+    if (interaction.isButton() && typeof interaction.customId === "string" && interaction.customId.startsWith("show_sources:")) {
+      const token = interaction.customId.split(":")[1] || "";
+      const data = getSources(token);
+      if (!data) {
+        await interaction.reply({ content: "這份來源已過期或不存在（請重新問一次我再產生）", flags: MessageFlags.Ephemeral }).catch(() => {});
+        return;
+      }
+      const content = formatSourcesForEphemeral(data.sources, data.userText);
+      await interaction.reply({ content, flags: MessageFlags.Ephemeral }).catch(() => {});
+      return;
+    }
+
     // 1) /setup_leave_button
     if (
       interaction.isChatInputCommand() &&
