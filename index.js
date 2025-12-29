@@ -1252,10 +1252,10 @@ async function googleLikeAnswer({ authorName, userText, userId }) {
 
   // 沒來源就不要亂答
   if (!sources.length) {
-    return { answer: "我現在沒辦法取得可驗證的來源，所以我不會亂猜。
+    return { answer: `我現在沒辦法取得可驗證的來源，所以我不會亂猜。
 你可以：
 1) 叫管理員補上 SERPER_API_KEY（搜尋）
-2) 或把關鍵字講更完整（地點/版本/專有名詞）。", sources: [] };
+2) 或把關鍵字講更完整（地點/版本/專有名詞）。`, sources: [] };
   }
 
   return await askGeminiWithSources({ authorName, userText, userId, sources });
