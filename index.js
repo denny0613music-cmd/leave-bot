@@ -300,16 +300,9 @@ function setCache(key, value) {
   cache.set(key, { at: Date.now(), value });
 }
 
-async function serperSearch(query, opts = {}) {
+async function serperSearch(query) {
   if (!SERPER_API_KEY) return [];
-  const q = String(query || "").trim();
-  if (!q) return [];
-
-  const num = Math.max(1, Math.min(20, Number(opts.num || 6)));
-  const gl = (opts.gl || "tw").toString();
-  const hl = (opts.hl || "zh-tw").toString();
-
-  const cacheKey = "serp:" + sha1(`${q}|${num}|${gl}|${hl}`);
+  const cacheKey = "serp:" + sha1(query);
   const cached = getCache(cacheKey);
   if (cached) return cached;
 
@@ -320,10 +313,10 @@ async function serperSearch(query, opts = {}) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      q,
-      num,
-      gl,
-      hl,
+      q: query,
+      num: 6,
+      gl: "tw",
+      hl: "zh-tw",
     }),
   });
 
@@ -335,7 +328,7 @@ async function serperSearch(query, opts = {}) {
 
   const data = await resp.json();
   const results =
-    (data.organic || []).slice(0, num).map((r) => ({
+    (data.organic || []).slice(0, 6).map((r) => ({
       title: r.title,
       link: r.link,
       snippet: r.snippet || "",
@@ -347,280 +340,218 @@ async function serperSearch(query, opts = {}) {
 }
 
 /* ===============================
-   Google-like++（更貼近 Google）：Query 改寫 + 權威加權 + 內文抓取 + 去重重排
-   ✅ 只影響 AI 搜尋回覆，不動請假/回報/人格/頻道限制/天氣流程
+   Google-like++：查詢改寫 + 去重重排 + 內文摘錄（更貼近 Google）
+   ✅ 只在搜尋流程使用，不動其他架構/人格
 ================================ */
 
-// 解析使用者是否有提到版本（例如 4.0 / 6.5）
-function extractVersionHint(text = "") {
-  const t = String(text || "");
-  const m = t.match(/\b([1-9])\s*\.\s*([0-9])\b/);
-  if (m && m[1] && m[2]) return `${m[1]}.${m[2]}`;
-  return "";
-}
-
-function normalizeText(t = "") {
-  return String(t || "")
-    .toLowerCase()
-    .replace(/[\u3000\s]+/g, " ")
-    .replace(/[’‘“”"(){}\[\]<>，,。.!?:：；;\\/|]/g, " ")
-    .trim();
-}
-
-function tokenize(text = "") {
-  const t = normalizeText(text);
-  const parts = t.split(" ").filter(Boolean);
-  // 保留較有用的 token（2+）
-  return parts.filter((x) => x.length >= 2).slice(0, 40);
-}
-
-// Query rewrite：同題拆 3–6 個查詢（中英/版本/專有名詞）
-function rewriteQueries(userText = "") {
-  const t = String(userText || "").trim();
-  const queries = [];
-  if (!t) return queries;
-
-  const version = extractVersionHint(t);
-  const hasFF14 = /(ff14|ffxiv|最終幻想14|太空戰士14)/i.test(t);
-  const hasDoHDoL = /(生產|製作|採集|工匠|do[h|l]|doh|dol)/i.test(t);
-  const isMSQ = /(主線|主线|msq)/i.test(t);
-
-  queries.push(t);
-
-  if (hasFF14) {
-    // 英文對照（更容易搜到完整條列與系統名詞）
-    const base = [
-      "FFXIV",
-      version ? `${version}` : "",
-      hasDoHDoL ? "DoH DoL crafting gathering" : "",
-      isMSQ ? "MSQ" : "",
-    ].filter(Boolean).join(" ");
-    queries.push(`${base} ${t}`);
-    if (hasDoHDoL) {
-      const exp =
-        /4\.0/.test(version) ? "Stormblood" :
-        /5\.0/.test(version) ? "Shadowbringers" :
-        /6\.0/.test(version) ? "Endwalker" :
-        /7\.0/.test(version) ? "Dawntrail" : "";
-      if (exp) queries.push(`FFXIV ${exp} crafting gathering after MSQ`);
-      queries.push(`FFXIV scrip gear legendary recipes secret recipes`);
-    }
-    if (isMSQ) queries.push(`FFXIV MSQ quest order list ${version || ""}`.trim());
-  }
-
-  // 去重
-  const uniq = [];
-  for (const q of queries) {
-    const qq = q.trim();
-    if (!qq) continue;
-    if (!uniq.includes(qq)) uniq.push(qq);
-  }
-  return uniq.slice(0, 6);
-}
-
-// 權威來源加權（簡單但有效）
-const AUTHORITY_WEIGHTS = [
-  // 官方/百科/大型 wiki
-  ["lodestone.finalfantasyxiv.com", 3.0],
-  ["square-enix.com", 2.5],
-  ["wikipedia.org", 2.0],
-  ["consolegameswiki.com", 2.0],
-  ["gamerescape.com", 1.8],
-  ["ffxiv.gamerescape.com", 1.8],
-  ["garlandtools.org", 1.6],
-  ["ffxivteamcraft.com", 1.5],
-  ["icy-veins.com", 1.2],
-  ["reddit.com", 0.9],
-];
-
-function getHost(url = "") {
+function normalizeUrl(u = "") {
   try {
-    return new URL(url).hostname.replace(/^www\./, "");
+    const url = new URL(u);
+    // 去掉 tracking 參數（保守）
+    ["utm_source","utm_medium","utm_campaign","utm_term","utm_content","fbclid","gclid"].forEach((k)=>url.searchParams.delete(k));
+    url.hash = "";
+    return url.toString();
   } catch {
-    return "";
+    return String(u || "").trim();
   }
 }
 
-function authorityScore(url = "") {
-  const host = getHost(url);
-  if (!host) return 0;
-  for (const [dom, w] of AUTHORITY_WEIGHTS) {
-    if (host === dom || host.endsWith("." + dom)) return w;
+function isFfxivCraftingPostMsqQuery(text = "") {
+  const t = String(text || "");
+  return /(ff14|ffxiv|最終幻想14|太空戰士14)/i.test(t)
+    && /(4\.0|紅蓮|红莲|stormblood)/i.test(t)
+    && /(生產|生产|製作|制作|採集|采集|工匠|匠人|do[h|l]|doh|dol)/i.test(t)
+    && /(主線|主线|msq).*?(完成|結束|结束)|完成.*?(主線|主线|msq)/i.test(t);
+}
+
+function rewriteQueries(userText = "") {
+  const q = String(userText || "").trim();
+  if (!q) return [];
+
+  // 針對你示範的 FF14 4.0 生產職問題：補上 Google 常見的關鍵字組合（中英 + 系統名詞）
+  if (isFfxivCraftingPostMsqQuery(q)) {
+    return [
+      "FF14 4.0 紅蓮 生產職 主線後 可以做什麼 Script Gear Legendary Secret 配方",
+      "FFXIV Stormblood crafting after MSQ scrip gear legendary recipes secret recipes",
+      "FF14 4.0 DoH DoL job quests scrip exchange legendary nodes collectables",
+      "紅蓮 生產 採集 神典石 製作裝 70級 傳說配方 秘傳配方",
+      "Stormblood collectables custom deliveries scrips crafting gear progression",
+    ];
   }
-  return 1.0;
+
+  // 通用：同題多角度（中文 + 英文）
+  const basic = [q];
+  if (/ff14|ffxiv/i.test(q)) basic.push(q.replace(/FF14/i, "FFXIV"));
+  if (/怎麼|如何|教程|教學/.test(q)) {
+    basic.push(q.replace(/怎麼|如何/, "教學"));
+  }
+  return [...new Set(basic)].slice(0, 5);
 }
 
-function keywordOverlapScore(userText = "", candidateText = "") {
-  const ut = tokenize(userText);
-  if (!ut.length) return 0;
-  const blob = normalizeText(candidateText);
-  let hit = 0;
-  for (const k of ut) if (blob.includes(k)) hit += 1;
-  return hit / Math.max(ut.length, 8);
+async function serperSearchN(query, num = 10) {
+  if (!SERPER_API_KEY) return [];
+  const cacheKey = "serpN:" + sha1(query) + ":" + String(num);
+  const cached = getCache(cacheKey);
+  if (cached) return cached;
+
+  const resp = await fetch("https://google.serper.dev/search", {
+    method: "POST",
+    headers: {
+      "X-API-KEY": SERPER_API_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      q: query,
+      num: Math.max(6, Math.min(20, num || 10)),
+      gl: "tw",
+      hl: "zh-tw",
+    }),
+  });
+
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => "");
+    console.warn("⚠️ Serper error:", resp.status, t?.slice?.(0, 200));
+    return [];
+  }
+
+  const data = await resp.json();
+  const results = ((data.organic || []).slice(0, Math.max(6, Math.min(20, num || 10))).map((r) => ({
+    title: r.title,
+    link: r.link,
+    snippet: r.snippet || "",
+    source: "google",
+  })) || []);
+
+  setCache(cacheKey, results);
+  return results;
 }
 
-function containsUsefulNumbers(text = "") {
-  return /\b\d{1,3}\b/.test(String(text || ""));
+function authorityScore(link = "") {
+  const u = String(link || "").toLowerCase();
+  // 官方/大型 wiki/權威攻略站加權（保守，不會只偏一站）
+  const boosts = [
+    ["na.finalfantasyxiv.com", 5],
+    ["lodestone", 4],
+    ["consolegameswiki", 3],
+    ["ffxiv.consolegameswiki", 3],
+    ["gamerescape", 3],
+    ["garlandtools", 3],
+    ["teamcraft", 2],
+    ["ffxivteamcraft", 2],
+    ["icy-veins", 2],
+    ["reddit.com", 1],
+    ["youtube.com", 0],
+  ];
+  for (const [k, s] of boosts) {
+    if (u.includes(k)) return s;
+  }
+  return 0;
 }
 
-function versionAlignPenalty(userText = "", text = "") {
-  const v = extractVersionHint(userText);
-  if (!v) return 0;
-  const blob = String(text || "");
-  // 有提版本但來源完全沒提：小扣分
-  if (!new RegExp(v.replace(".", "\\."), "i").test(blob)) return -0.6;
-  return 0.2; // 有對齊就小加分
-}
-
-function scoreSource(userText = "", s = {}) {
-  const title = s?.title || "";
-  const snippet = s?.snippet || "";
-  const link = s?.link || "";
-  const blob = `${title}\n${snippet}`;
+function relevanceScore(userText = "", item = {}) {
+  const t = (String(item.title || "") + " " + String(item.snippet || "")).toLowerCase();
+  const q = String(userText || "").toLowerCase();
   let score = 0;
 
-  score += authorityScore(link); // 1.0 ~ 3.0
-  score += 1.8 * keywordOverlapScore(userText, blob); // 0 ~ 1.8
-  score += containsUsefulNumbers(blob) ? 0.35 : 0;
-  score += Math.min(0.6, (String(snippet || "").length / 400) * 0.6);
-  score += versionAlignPenalty(userText, blob);
+  // 覆蓋問題關鍵字（粗略）
+  for (const w of ["4.0","stormblood","紅蓮","script","scrip","legendary","secret","doh","dol","craft","gather","collectable","custom deliveries"]) {
+    if (q.includes(w) && t.includes(w)) score += 2;
+  }
 
-  // 明顯不對齊（整段旅程 vs 剩餘任務）的小扣分（你原本已有 note，我們也用來排序）
-  const note = alignmentNote(userText, s);
-  if (note) score -= 0.5;
+  // 有條列/數字/系統名詞 → 更像攻略
+  if (/(\d{2,3}|70|4\.0)/.test(t)) score += 2;
+  if (/(script gear|scrip|legendary|secret|collectable|custom deliveries|job quest)/.test(t)) score += 2;
+  if (/(\-|•|•)/.test(item.snippet || "")) score += 1;
 
+  score += authorityScore(item.link);
   return score;
 }
 
-function dedupeSources(list = []) {
-  const out = [];
-  const seen = new Set();
-  for (const s of list) {
-    const link = (s?.link || "").toString().trim();
-    const host = getHost(link);
-    const key = link ? link : `${host}|${(s?.title || "").toString().slice(0, 60)}`;
-    if (!key) continue;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(s);
+function dedupeAndRerank(userText = "", items = []) {
+  const byLink = new Map();
+  for (const it of items || []) {
+    const link = normalizeUrl(it?.link || "");
+    if (!link) continue;
+    const prev = byLink.get(link);
+    if (!prev) byLink.set(link, { ...it, link });
+    else {
+      // 合併較長 snippet
+      const a = String(prev.snippet || "");
+      const b = String(it.snippet || "");
+      if (b.length > a.length) byLink.set(link, { ...prev, ...it, link, snippet: b });
+    }
   }
-  return out;
+  const arr = [...byLink.values()];
+  arr.sort((a, b) => relevanceScore(userText, b) - relevanceScore(userText, a));
+  return arr;
 }
 
-function rerankSources(userText = "", list = []) {
-  return [...list]
-    .map((s) => ({ s, score: scoreSource(userText, s) }))
-    .sort((a, b) => b.score - a.score)
-    .map((x) => x.s);
+function stripHtml(html = "") {
+  const s = String(html || "");
+  return s
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
-// 內文抓取：只抓 Top N 篇、短超時、失敗就跳過（穩定優先）
-async function fetchTextFromUrl(url, timeoutMs = 4500) {
+async function fetchPageExcerpt(url, timeoutMs = 4500) {
+  const link = normalizeUrl(url);
+  if (!link) return "";
+  const cacheKey = "page:" + sha1(link);
+  const cached = getCache(cacheKey);
+  if (cached) return cached;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const ctrl = new AbortController();
-    const tid = setTimeout(() => ctrl.abort(), timeoutMs);
-
-    const resp = await fetch(url, {
+    const resp = await fetch(link, {
       method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
       headers: {
         "User-Agent": "Mozilla/5.0 (compatible; DiscordBot/1.0; +https://discord.com)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml",
       },
-      signal: ctrl.signal,
     });
-
-    clearTimeout(tid);
-
     if (!resp.ok) return "";
     const ct = (resp.headers.get("content-type") || "").toLowerCase();
-    if (!ct.includes("text/html") && !ct.includes("application/xhtml")) return "";
-
+    if (!ct.includes("text/html")) return "";
     const html = await resp.text();
-
-    // 移除 script/style
-    const cleaned = html
-      .replace(/<script[\s\S]*?<\/script>/gi, " ")
-      .replace(/<style[\s\S]*?<\/style>/gi, " ")
-      .replace(/<!--[\s\S]*?-->/g, " ");
-
-    // 把 tag 變空格
-    const text = cleaned
-      .replace(/<[^>]+>/g, " ")
-      .replace(/[\u3000\s]+/g, " ")
-      .trim();
-
-    return text.slice(0, 14000);
+    const plain = stripHtml(html);
+    const excerpt = plain.slice(0, 900); // 控制 token
+    setCache(cacheKey, excerpt);
+    return excerpt;
   } catch {
     return "";
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-// 從頁面文字挑最貼題段落（3 段以內）
-function extractKeyPassages(pageText = "", userText = "") {
-  const raw = String(pageText || "");
-  if (!raw) return "";
-
-  // 簡易分段：遇到句點/換行後切
-  const parts = raw.split(/(?<=\.)\s+|(?<=。)\s+|\n+/).map((x) => x.trim()).filter(Boolean);
-
-  const tokens = tokenize(userText);
-  const scored = parts
-    .slice(0, 200) // 不要掃太多
-    .map((p) => {
-      let hit = 0;
-      const low = p.toLowerCase();
-      for (const k of tokens) if (low.includes(k)) hit += 1;
-      return { p, hit };
-    })
-    .filter((x) => x.p.length >= 40);
-
-  scored.sort((a, b) => b.hit - a.hit || b.p.length - a.p.length);
-
-  const picked = [];
-  for (const it of scored) {
-    if (it.hit <= 0 && picked.length) break;
-    // 去除太像的段落
-    if (picked.some((x) => x.slice(0, 80) === it.p.slice(0, 80))) continue;
-    picked.push(it.p);
-    if (picked.length >= 3) break;
-  }
-
-  const out = picked.length ? picked : parts.slice(0, 2);
-  return out.join("\n").slice(0, 1200);
-}
-
-async function enrichTopSourcesWithContent(userText = "", sources = [], topN = 3) {
-  const enriched = [...sources];
-  const n = Math.min(topN, enriched.length);
-
+async function enrichTopWithExcerpts(items = [], topN = 3) {
+  const out = [...items];
+  const n = Math.min(topN, out.length);
   for (let i = 0; i < n; i++) {
-    const s = enriched[i];
-    const link = (s?.link || "").toString().trim();
-    if (!link) continue;
+    const it = out[i];
+    if (!it?.link) continue;
+    const ex = await fetchPageExcerpt(it.link);
+    if (ex) {
+      out[i] = {
+        ...it,
+        snippet: `${String(it.snippet || "").trim()}
 
-    const ck = "page:" + sha1(link);
-    const cached = getCache(ck);
-    if (cached) {
-      enriched[i] = { ...s, snippet: cached };
-      continue;
+摘錄：${ex}`.trim(),
+      };
     }
-
-    const pageText = await fetchTextFromUrl(link);
-    const key = extractKeyPassages(pageText, userText);
-    if (!key) continue;
-
-    const mergedSnippet = [
-      s.snippet ? String(s.snippet).trim() : "",
-      "",
-      "【內文重點摘錄】",
-      key,
-    ].filter(Boolean).join("\n");
-
-    setCache(ck, mergedSnippet);
-    enriched[i] = { ...s, snippet: mergedSnippet };
   }
-
-  return enriched;
+  return out;
 }
 
 /* ===============================
@@ -1051,6 +982,8 @@ async function askGeminiWithSources({ authorName, userText, userId, sources }) {
 - 若 Sources 沒有足夠資訊：直接說「查不到/不確定」，並建議使用者補充關鍵字。
 - 若 Sources 互相矛盾：指出矛盾，並偏向官方/權威來源。
 - 回答用繁體中文，條列、簡潔。
+${isFfxivCraftingPostMsqQuery(userText)?`- 若問題是『FF14 4.0 主線後 生產/採集能做什麼』這類廣泛題：請至少涵蓋 3 個面向（例如：等級/裝備進程、職業任務/配方、採集/素材或交付/收藏品），並用小標題分段。
+`:''}
 - 最後加上：來源：#1 #2 ...（只列你真的用到的）
 `;
 
@@ -1209,35 +1142,23 @@ async function googleLikeAnswer({ authorName, userText, userId }) {
     }
   }
 
-  // 2) 其他事實：Google Search（Serper）— Google-like++
-  //    - 同題多查詢（中英/版本/專有名詞）
-  //    - 先聚合 → 去重 → 權威/關鍵詞重排
-  //    - 再抓 Top 3 內文重點 → 再重排 → 取 Top 8
-  //    - 天氣也可補一點 Google 結果，貼近「Google」體感
+  // 2) 其他事實：Google Search（Serper）
+  //    - 天氣也一起補一點 Google 結果，貼近「Google」體感
   const queries = rewriteQueries(userText);
-  const aggregated = [];
-
-  for (const q of queries) {
-    const rs = await serperSearch(q, { num: 10, gl: "tw", hl: "zh-tw" });
-    for (const r of rs) aggregated.push(r);
+  const raw = [];
+  for (const q of (queries.length ? queries : [userText])) {
+    try {
+      const rs = await serperSearchN(q, 12);
+      for (const r of rs) raw.push(r);
+    } catch (e) {
+      console.warn('⚠️ serperSearchN failed:', e?.message || e);
+    }
   }
 
-  const deduped = dedupeSources(aggregated);
-  const firstRank = rerankSources(userText, deduped);
-
-  // 先取前 10 個去抓內文（避免太慢）
-  const preTop = firstRank.slice(0, 10);
-  const enriched = await enrichTopSourcesWithContent(userText, preTop, 3);
-
-  // 把 enrich 後的 preTop 合併回全體，並以 link 替換
-  const byLink = new Map();
-  for (const s of enriched) {
-    if (s?.link) byLink.set(s.link, s);
-  }
-  const mergedAll = firstRank.map((s) => (s?.link && byLink.has(s.link) ? byLink.get(s.link) : s));
-
-  const finalRank = rerankSources(userText, dedupeSources(mergedAll));
-  for (const r of finalRank.slice(0, 8)) sources.push(r);
+  let ranked = dedupeAndRerank(userText, raw);
+  ranked = ranked.slice(0, 8);
+  ranked = await enrichTopWithExcerpts(ranked, 3);
+  for (const r of ranked) sources.push(r);
 
   // 沒來源就不要亂答
   if (!sources.length) {
