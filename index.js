@@ -626,8 +626,6 @@ async function enrichTopSourcesWithContent(userText = "", sources = [], topN = 3
 /* ===============================
    天氣：走 Open-Meteo（避免 AI 亂掰）
 ================================ */
-（避免 AI 亂掰）
-================================ */
 const WEATHER_PROVIDER = (process.env.WEATHER_PROVIDER || "openmeteo").trim();
 
 function isWeatherQuery(text = "") {
