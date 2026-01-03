@@ -1186,6 +1186,223 @@ async function tryFindFfxivMsqOrdinalEvidence(userText) {
   return { evidence: null, extraSources };
 }
 
+
+/* ===============================
+   FF14 強化層（專用：多資源 + 白名單 + 本地索引 + 子意圖）
+   ✅ 只影響「搜尋模式」googleLikeAnswer，不動其他架構/人格/按鈕/請假回報
+================================ */
+
+// （可選）本地 FF14 索引：用於「Google 很難找到」但你確定的對照（例如：任務序號為玩家整理）
+// - 你可以在 Render 環境變數放：FFXIV_LOCAL_INDEX_JSON 來覆蓋/擴充（JSON 字串）
+// - 範例：{"翻越火牆":{"expansion":"2.0","level":41,"unofficial_order":114,"note":"序號為玩家整理，非官方"}}
+const FFXIV_LOCAL_INDEX = (() => {
+  let base = {}; // 先留空：避免我們在這裡硬塞不確定資料
+  try {
+    const raw = (process.env.FFXIV_LOCAL_INDEX_JSON || "").trim();
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") base = parsed;
+    }
+  } catch (e) {
+    console.warn("⚠️ FFXIV_LOCAL_INDEX_JSON parse failed:", e?.message || e);
+  }
+  return base;
+})();
+
+// FF14 權威/高品質來源白名單（排序不代表唯一正確，但可提高可信度）
+const FFXIV_AUTH_SITES = [
+  "na.finalfantasyxiv.com",            // 官方
+  "eu.finalfantasyxiv.com",
+  "jp.finalfantasyxiv.com",
+  "lodestone",
+  "ffxiv.consolegameswiki.com",        // Wiki
+  "ffxiv.gamerescape.com",             // Wiki
+  "garlandtools.org",                  // 工具/資料
+  "ffxivteamcraft.com",                // Teamcraft
+  "icy-veins.com",                     // 攻略
+  "www.reddit.com",                    // 經驗（低權重，但可補缺）
+];
+
+function isFfxivQuery(text = "") {
+  const t = String(text || "");
+  return /(ff14|ffxiv|最終幻想14|太空戰士14|最终幻想14|太空战士14|艾欧泽亚|以太之光|光之战士|海德林|海德林|ガレマール|エオルゼア|暁月|曉月|暗影|漆黑|紅蓮|苍穹|蒼天|新生|2\.0|3\.0|4\.0|5\.0|6\.0|7\.0)/i.test(
+    t
+  );
+}
+
+function detectFfxivSubintent(text = "") {
+  const t = String(text || "");
+  if (/(第幾個|第几个|第幾|第几|序號|順序|順番|任務順序|任务顺序)/i.test(t) && /(主線|主线|msq|任務|任务)/i.test(t)) return "MSQ_ORDINAL";
+  if (/(在哪|在哪裡|哪里|位置|坐標|座標|X[:：]?\s*\d+|Y[:：]?\s*\d+|地图|地圖|npc)/i.test(t)) return "LOCATION";
+  if (/(怎麼開|如何開|解鎖|开启|開啟|前置|前置任務|觸發|触发|unlock)/i.test(t)) return "UNLOCK";
+  if (/(怎麼拿|如何拿|取得|獲得|获得|掉落|採集|采集|製作|制作|配方|素材|材料|交換|兑换|商人|貨幣|货币|scrip|script|神典石|詩學|诗学)/i.test(t)) return "OBTAIN";
+  if (/(生產|生产|製作|制作|採集|采集|工匠|匠人|doh|dol|鍛|裁|刻|革|錬|甲|木|鍛冶|裁縫|刻木|製革|錬金|甲冑|採掘|園藝|漁師|漁|craft|gather|collectable|custom deliveries)/i.test(t)) return "CRAFT_GATHER";
+  if (/(副本|迷宮|地下城|討伐|討灭|歼灭|极|極|零式|绝|絕|raid|trial|dungeon)/i.test(t)) return "DUTY";
+  return "GENERAL";
+}
+
+// 針對 FF14 問題做查詢改寫：中英日混搜 + 白名單 site: 加強
+function rewriteFfxivQueries(userText = "") {
+  const q = String(userText || "").trim();
+  if (!q) return [];
+
+  const sub = detectFfxivSubintent(q);
+  const name = extractLikelyQuestName(q); // 你原本的抽取器，沿用
+
+  // MSQ 序號類：優先讓 snippet/標題更可能帶數字
+  if (sub === "MSQ_ORDINAL") {
+    const base = [];
+    if (name) {
+      base.push(`FF14 "${name}" 主線任務 第幾個`);
+      base.push(`FFXIV "${name}" MSQ quest order number`);
+      base.push(`site:ffxiv.consolegameswiki.com "${name}" "Main Scenario"`);
+      base.push(`site:ffxiv.gamerescape.com "${name}" "Main Scenario"`);
+    } else {
+      base.push(`FF14 主線 任務 順序 清單 2.0 3.0 4.0`);
+      base.push(`FFXIV MSQ quest list order`);
+    }
+    return base;
+  }
+
+  // 位置/坐標/NPC
+  if (sub === "LOCATION") {
+    const base = [];
+    if (name) {
+      base.push(`FF14 "${name}" 在哪`);
+      base.push(`FFXIV "${name}" location npc coordinates`);
+      base.push(`site:ffxiv.consolegameswiki.com "${name}"`);
+      base.push(`site:ffxiv.gamerescape.com "${name}"`);
+      base.push(`site:garlandtools.org "${name}"`);
+    } else {
+      base.push(`FF14 任務 NPC 坐標 查詢`);
+      base.push(`FFXIV quest npc coordinates`);
+    }
+    return base;
+  }
+
+  // 解鎖/前置
+  if (sub === "UNLOCK") {
+    const base = [];
+    if (name) {
+      base.push(`FF14 "${name}" 解鎖 前置 任務`);
+      base.push(`FFXIV "${name}" unlock requirements prerequisites`);
+      base.push(`site:ffxiv.consolegameswiki.com "${name}" unlock`);
+      base.push(`site:ffxiv.gamerescape.com "${name}" unlock`);
+    } else {
+      base.push(`FF14 解鎖 前置 任務 怎麼開`);
+      base.push(`FFXIV unlock requirements prerequisites`);
+    }
+    return base;
+  }
+
+  // 取得/掉落/製作/交換
+  if (sub === "OBTAIN") {
+    const base = [];
+    base.push(`FF14 ${q} 怎麼拿`);
+    base.push(`FFXIV ${q} how to get`);
+    base.push(`site:garlandtools.org ${q}`);
+    base.push(`site:ffxivteamcraft.com ${q}`);
+    base.push(`site:ffxiv.consolegameswiki.com ${q}`);
+    return base;
+  }
+
+  // 生產/採集（你原本有特殊版，我們保留並再補）
+  if (sub === "CRAFT_GATHER") {
+    // 先沿用你原本針對 4.0 的強化（不動原邏輯）
+    const preset = rewriteQueries(q);
+    const add = [
+      `FFXIV ${q} scrip gear collectables`,
+      `site:ffxivteamcraft.com ${q}`,
+      `site:icy-veins.com ${q}`,
+    ];
+    return [...new Set([...preset, ...add])].slice(0, 8);
+  }
+
+  // 副本/討伐
+  if (sub === "DUTY") {
+    const base = [];
+    base.push(`FF14 ${q} 解鎖 前置`);
+    base.push(`FFXIV ${q} unlock requirements`);
+    base.push(`FFXIV ${q} level item level`);
+    base.push(`site:ffxiv.consolegameswiki.com ${q}`);
+    base.push(`site:ffxiv.gamerescape.com ${q}`);
+    return base;
+  }
+
+  // 一般：中英混搜 + 官方/權威站輔助
+  const base = [
+    q,
+    /ff14/i.test(q) ? q.replace(/ff14/ig, "FFXIV") : `FFXIV ${q}`,
+    `FF14 ${q}`,
+    `site:ffxiv.consolegameswiki.com ${q}`,
+    `site:ffxiv.gamerescape.com ${q}`,
+  ];
+  return [...new Set(base)].slice(0, 8);
+}
+
+function isTrustedFfxivSource(link = "") {
+  const u = String(link || "").toLowerCase();
+  return FFXIV_AUTH_SITES.some((d) => u.includes(String(d).toLowerCase()));
+}
+
+async function ffxivEnhancedSources(userText = "") {
+  if (!SERPER_API_KEY) return []; // 沒 serper 就不做（避免亂掰）
+  const queries = rewriteFfxivQueries(userText);
+  const raw = [];
+
+  for (const q of queries.slice(0, 6)) {
+    try {
+      const rs = await serperSearchN(q, 12);
+      for (const r of rs) raw.push(r);
+    } catch (e) {
+      console.warn("⚠️ ffxiv serperSearchN failed:", e?.message || e);
+    }
+  }
+
+  // 先排一次（保留更多，稍後再切）
+  let ranked = dedupeAndRerank(userText, raw);
+
+  // 把「白名單來源」往前提（但不丟掉其他結果）
+  ranked.sort((a, b) => {
+    const ta = isTrustedFfxivSource(a.link) ? 1 : 0;
+    const tb = isTrustedFfxivSource(b.link) ? 1 : 0;
+    if (ta !== tb) return tb - ta;
+    return relevanceScore(userText, b) - relevanceScore(userText, a);
+  });
+
+  ranked = ranked.slice(0, 10);
+
+  // 對 FF14：多抓一些摘錄（Wiki/工具站常在內文才有關鍵）
+  ranked = await enrichTopWithExcerpts(ranked, 5);
+
+  return ranked;
+}
+
+// 沒有任何可驗證來源時：給「通用方法」而不是硬說查不到（仍不陳述具體事實）
+async function askGeminiFfxivFallbackGeneral({ authorName, userText, userId }) {
+  if (!GEMINI_API_KEY) {
+    return `我現在暫時沒法查到可驗證來源（也缺 GEMINI_API_KEY），所以我不會亂猜。
+你可以補：版本（2.0/3.0/4.0…）、內容類型（主線/支線/副本/生產採集）、以及名稱（任務/道具/副本）。`;
+  }
+
+  const history = convoMemory.get(userId) || [];
+
+  const system = [
+    "你是 FF14（FFXIV）問題的『通用引導助理』。",
+    "限制：你現在沒有可靠來源可引用，因此『禁止』給出具體數字/座標/NPC 名/任務序號/版本細節等可被當成事實的內容。",
+    "你可以做的事：",
+    "1) 用繁中提供『一般流程/常見做法/如何自己快速查證』",
+    "2) 提供 3–5 個高品質查詢關鍵字組合（中英），以及推薦查詢站點（官方 / consolegameswiki / gamerescape / garlandtools / teamcraft）",
+    "3) 指出使用者需要補哪些關鍵資訊，讓你下一次可以用搜尋模式精準回答",
+    "回覆要短、條列、可執行。",
+  ].join("\n");
+
+  const prompt = [system, "", buildUserPrompt({ authorName, userText, history })].join("\n");
+  const model = await getGeminiModel(null, userId);
+  const result = await model.generateContent(prompt);
+  const text = result?.response?.text?.() || "";
+  return text.trim() || "你可以補上版本/名稱/你要查的是任務還是道具，我就能更精準。";
+}
 async function googleLikeAnswer({ authorName, userText, userId }) {
   const sources = [];
 
@@ -1232,9 +1449,56 @@ async function googleLikeAnswer({ authorName, userText, userId }) {
     }
   }
 
-  // 2) 其他事實：Google Search（Serper）
-  //    - 天氣也一起補一點 Google 結果，貼近「Google」體感
-  const queries = rewriteQueries(userText);
+
+// 2) FF14 強化：多資源（白名單 + 中英日混搜 + 摘錄），先塞進 Sources（提高命中與可驗證性）
+if (isFfxivQuery(userText)) {
+  try {
+    // 2-1) 本地索引（你自己認可的對照，優先；避免 Google/AI 找不到「第幾個」這種非官方欄位）
+    const questGuess = extractLikelyQuestName(userText);
+    const candidates = [];
+    for (const [k, v] of Object.entries(FFXIV_LOCAL_INDEX || {})) {
+      if (!k) continue;
+      const kk = String(k);
+      const hit =
+        (questGuess && kk.includes(questGuess)) ||
+        (questGuess && String(questGuess).includes(kk)) ||
+        String(userText || "").includes(kk);
+      if (hit) candidates.push([kk, v]);
+    }
+    if (candidates.length) {
+      const [name, info] = candidates[0];
+      const snippetLines = [];
+      if (info?.expansion) snippetLines.push(`版本：${info.expansion}`);
+      if (info?.level) snippetLines.push(`任務等級：約 ${info.level}`);
+      if (info?.unofficial_order) snippetLines.push(`主線順序：第 ${info.unofficial_order} 個（非官方編號）`);
+      if (info?.note) snippetLines.push(`註記：${info.note}`);
+      sources.push({
+        title: `FF14 本地索引：${name}`,
+        snippet: snippetLines.join("
+") || "（本地索引命中）",
+        link: "",
+        source: "local",
+      });
+    }
+
+    // 2-2) 權威站點 + 摘錄補強（需要 SERPER_API_KEY）
+    const extra = await ffxivEnhancedSources(userText);
+    const seen = new Set(sources.map((s) => normalizeUrl(s?.link || "")));
+    for (const s of extra) {
+      const link = normalizeUrl(s?.link || "");
+      if (!link) continue;
+      if (seen.has(link)) continue;
+      sources.push(s);
+      seen.add(link);
+    }
+  } catch (e) {
+    console.warn("⚠️ ffxivEnhancedSources failed:", e?.message || e);
+  }
+}
+
+// 3) 其他事實：Google Search（Serper）
+//    - 天氣也一起補一點 Google 結果，貼近「Google」體感
+const queries = rewriteQueries(userText);
   const raw = [];
   for (const q of (queries.length ? queries : [userText])) {
     try {
@@ -1250,8 +1514,13 @@ async function googleLikeAnswer({ authorName, userText, userId }) {
   ranked = await enrichTopWithExcerpts(ranked, 3);
   for (const r of ranked) sources.push(r);
 
-  // 沒來源就不要亂答
+
+  // 沒來源時：一般題不亂猜；FF14 類給「可執行的通用引導」（不陳述具體事實）
   if (!sources.length) {
+    if (isFfxivQuery(userText)) {
+      const fallback = await askGeminiFfxivFallbackGeneral({ authorName, userText, userId });
+      return { answer: fallback, sources: [] };
+    }
     return { answer: `我現在沒辦法取得可驗證的來源，所以我不會亂猜。
 你可以：
 1) 叫管理員補上 SERPER_API_KEY（搜尋）
