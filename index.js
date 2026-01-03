@@ -1474,8 +1474,7 @@ if (isFfxivQuery(userText)) {
       if (info?.note) snippetLines.push(`註記：${info.note}`);
       sources.push({
         title: `FF14 本地索引：${name}`,
-        snippet: snippetLines.join("
-") || "（本地索引命中）",
+        snippet: snippetLines.join("\n") || "（本地索引命中）",
         link: "",
         source: "local",
       });
